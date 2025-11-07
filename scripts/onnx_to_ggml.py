@@ -43,7 +43,12 @@ def get_ggml_type(elem_type):
 
 
 def generate_cpp_code(model, output_path):
-    """Generate C++ code from ONNX model."""
+    """Generate C++ code from ONNX model.
+
+    Creates two files:
+    - <name>_graph.h: Contains the getGraph() function
+    - <name>.cpp: Contains all boilerplate code and includes the graph header
+    """
     graph = model.graph
 
     # Collect initializers (weights/constants)
@@ -88,7 +93,25 @@ def generate_cpp_code(model, output_path):
                                 channels,
                             )
 
-    # Start building the C++ code
+    # Determine output paths
+    from pathlib import Path
+
+    output_path_obj = Path(output_path)
+    output_stem = output_path_obj.stem
+    output_dir = output_path_obj.parent
+
+    # Generate <name>_graph.h and <name>.cpp
+    graph_header_path = output_dir / f"{output_stem}_graph.h"
+
+    # Start building the graph header file
+    graph_lines = []
+    graph_lines.append("#pragma once")
+    graph_lines.append("")
+    graph_lines.append('#include "ggml.h"')
+    graph_lines.append('#include "ggml-onnx.h"')
+    graph_lines.append("")
+
+    # Start building the main C++ code
     cpp_lines = []
     cpp_lines.append('#include "ggml.h"')
     cpp_lines.append('#include "ggml-onnx.h"')
@@ -105,6 +128,7 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("#include <unordered_map>")
     cpp_lines.append("")
     cpp_lines.append('#include "safetensors.hpp"')
+    cpp_lines.append(f'#include "{graph_header_path.name}"')
     cpp_lines.append("")
 
     # Add global variables
@@ -114,13 +138,16 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("ggml_context* ctx_weights = NULL;")
     cpp_lines.append("")
 
-    # Add weight tensor declarations
+    # Add weight tensor declarations in cpp file and extern declarations in header
     if initializers:
         cpp_lines.append("// Weight tensors")
+        graph_lines.append("// External weight tensor declarations")
         for init_name in initializers.keys():
             var_name = sanitize_name(init_name)
             cpp_lines.append(f"ggml_tensor* {var_name} = NULL;")
+            graph_lines.append(f"extern ggml_tensor* {var_name};")
         cpp_lines.append("")
+        graph_lines.append("")
 
         # Add tensor map for dynamic loading
         cpp_lines.append("// Tensor map for weight loading")
@@ -234,9 +261,9 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("}")
     cpp_lines.append("")
 
-    # Generate getGraph function
-    cpp_lines.append("// Build the computation graph")
-    cpp_lines.append("ggml_cgraph* getGraph(ggml_context* ctx, ggml_tensor* input) {")
+    # Generate getGraph function in the graph header file
+    graph_lines.append("// Build the computation graph")
+    graph_lines.append("ggml_cgraph* getGraph(ggml_context* ctx, ggml_tensor* input) {")
     # Find input tensors
     inputs = {inp.name: inp for inp in graph.input if inp.name not in initializers}
 
@@ -246,16 +273,16 @@ def generate_cpp_code(model, output_path):
         var_name = sanitize_name(input_name)
         tensor_vars[input_name] = var_name
         if var_name != "input":
-            cpp_lines.append(f"    // Input: {input_name}")
-            cpp_lines.append(f"    ggml_tensor* {var_name} = input;")
-            cpp_lines.append("")
+            graph_lines.append(f"    // Input: {input_name}")
+            graph_lines.append(f"    ggml_tensor* {var_name} = input;")
+            graph_lines.append("")
     else:
-        cpp_lines.append("    // TODO: Handle multiple inputs")
+        graph_lines.append("    // TODO: Handle multiple inputs")
         for i, (input_name, inp) in enumerate(inputs.items()):
             var_name = sanitize_name(input_name)
             tensor_vars[input_name] = var_name
-            cpp_lines.append(f"    ggml_tensor* {var_name} = input; // {input_name}")
-        cpp_lines.append("")
+            graph_lines.append(f"    ggml_tensor* {var_name} = input; // {input_name}")
+        graph_lines.append("")
 
     # Reference weight tensors (already created globally)
     for init_name in initializers.keys():
@@ -263,12 +290,12 @@ def generate_cpp_code(model, output_path):
         tensor_vars[init_name] = var_name
 
     # Process each node in the graph
-    cpp_lines.append("    // Graph operations")
+    graph_lines.append("    // Graph operations")
     for node in graph.node:
         op_type = node.op_type
         node_name = node.name if node.name else f"{op_type}_node"
 
-        cpp_lines.append(f"    // Node: {node_name} (Op: {op_type})")
+        graph_lines.append(f"    // Node: {node_name} (Op: {op_type})")
 
         # Get input variables
         input_vars = []
@@ -312,37 +339,37 @@ def generate_cpp_code(model, output_path):
                     attrs.append(f'{attr_name}="{attr.s.decode()}"')
 
             if attrs:
-                cpp_lines.append(f'    // Attributes: {", ".join(attrs)}')
+                graph_lines.append(f'    // Attributes: {", ".join(attrs)}')
 
-            cpp_lines.append(f"    ggml_tensor* {output_vars[0]} = {func_name}(ctx, {inputs_str});")
+            graph_lines.append(f"    ggml_tensor* {output_vars[0]} = {func_name}(ctx, {inputs_str});")
         else:
-            cpp_lines.append(f"    // Multiple outputs from {op_type}")
+            graph_lines.append(f"    // Multiple outputs from {op_type}")
             for out_var in output_vars:
-                cpp_lines.append(f"    ggml_tensor* {out_var} = nullptr; // TODO: Handle multi-output ops")
+                graph_lines.append(f"    ggml_tensor* {out_var} = nullptr; // TODO: Handle multi-output ops")
 
-        cpp_lines.append("")
+        graph_lines.append("")
 
     # Find output tensor
     outputs = {out.name: out for out in graph.output}
 
-    cpp_lines.append("    // Build forward graph")
-    cpp_lines.append("    ggml_cgraph* gf = ggml_new_graph(ctx);")
+    graph_lines.append("    // Build forward graph")
+    graph_lines.append("    ggml_cgraph* gf = ggml_new_graph(ctx);")
 
     if len(outputs) == 1:
         output_name = list(outputs.keys())[0]
         output_var = tensor_vars.get(output_name, sanitize_name(output_name))
-        cpp_lines.append(f"    // Graph output: {output_name}")
-        cpp_lines.append(f"    ggml_build_forward_expand(gf, {output_var});")
+        graph_lines.append(f"    // Graph output: {output_name}")
+        graph_lines.append(f"    ggml_build_forward_expand(gf, {output_var});")
     else:
-        cpp_lines.append("    // Multiple outputs")
+        graph_lines.append("    // Multiple outputs")
         for output_name in outputs.keys():
             output_var = tensor_vars.get(output_name, sanitize_name(output_name))
-            cpp_lines.append(f"    ggml_build_forward_expand(gf, {output_var}); // {output_name}")
+            graph_lines.append(f"    ggml_build_forward_expand(gf, {output_var}); // {output_name}")
 
-    cpp_lines.append("")
-    cpp_lines.append("    return gf;")
-    cpp_lines.append("}")
-    cpp_lines.append("")
+    graph_lines.append("")
+    graph_lines.append("    return gf;")
+    graph_lines.append("}")
+    graph_lines.append("")
 
     # Generate predict function
     cpp_lines.append("// Execute the graph and print output")
@@ -500,11 +527,18 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("}")
     cpp_lines.append("")
 
-    # Write to file
+    # Write both files
+    # Write the graph header file
+    with open(graph_header_path, "w") as f:
+        f.write("\n".join(graph_lines))
+
+    # Write the main cpp file
     with open(output_path, "w") as f:
         f.write("\n".join(cpp_lines))
 
-    print(f"Generated C++ code: {output_path}")
+    print(f"Generated C++ files:")
+    print(f"  - Graph header: {graph_header_path}")
+    print(f"  - Main file: {output_path}")
     print(f"  - Input tensors: {len(inputs)}")
     print(f"  - Output tensors: {len(outputs)}")
     print(f"  - Operations: {len(graph.node)}")
@@ -539,7 +573,11 @@ def main():
     # Generate C++ code
     try:
         generate_cpp_code(model, output_path)
-        print(f"\nSuccess! Generated: {output_path}")
+        output_path_obj = Path(output_path)
+        graph_header_name = f"{output_path_obj.stem}_graph.h"
+        print(f"\nSuccess! Generated files:")
+        print(f"  - {output_path}")
+        print(f"  - {output_path_obj.parent / graph_header_name}")
         print(f"\nNext steps:")
         print(f"  1. Ensure safetensors.hpp is in your include path")
         print(f"  2. Implement ggml_onnx_* functions in ggml-onnx.h")
