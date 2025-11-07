@@ -99,8 +99,12 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("#endif")
     cpp_lines.append("")
     cpp_lines.append("#include <vector>")
+    cpp_lines.append("#include <string>")
     cpp_lines.append("#include <iostream>")
     cpp_lines.append("#include <cstring>")
+    cpp_lines.append("#include <unordered_map>")
+    cpp_lines.append("")
+    cpp_lines.append('#include "safetensors.hpp"')
     cpp_lines.append("")
 
     # Add global variables
@@ -116,6 +120,11 @@ def generate_cpp_code(model, output_path):
         for init_name in initializers.keys():
             var_name = sanitize_name(init_name)
             cpp_lines.append(f"ggml_tensor* {var_name} = NULL;")
+        cpp_lines.append("")
+
+        # Add tensor map for dynamic loading
+        cpp_lines.append("// Tensor map for weight loading")
+        cpp_lines.append("std::unordered_map<std::string, struct ggml_tensor*> tensor_map;")
         cpp_lines.append("")
 
     # Generate backend initialization
@@ -142,7 +151,7 @@ def generate_cpp_code(model, output_path):
 
     # Generate function to load initializers
     cpp_lines.append("// Load model weights and constants")
-    cpp_lines.append("void load_weights() {")
+    cpp_lines.append("void load_weights(const std::string& weights_file) {")
     cpp_lines.append(f"    // Create context for weights")
     cpp_lines.append(f"    int num_weight_tensors = {len(initializers)};")
     cpp_lines.append("    ctx_weights = ggml_init({")
@@ -151,7 +160,7 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("        /*.no_alloc   =*/ true,")
     cpp_lines.append("    });")
     cpp_lines.append("")
-    cpp_lines.append("    // Define weight tensors")
+    cpp_lines.append("    // Define weight tensors and populate tensor map")
 
     for init_name in initializers.keys():
         var_name = sanitize_name(init_name)
@@ -169,6 +178,7 @@ def generate_cpp_code(model, output_path):
             cpp_lines.append(
                 f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(init.data_type)}, 1, 1, {channels}, 1);"
             )
+            cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
             continue  # Skip the normal dimension handling below
         else:
             cpp_lines.append(f"    // {init_name}")
@@ -196,19 +206,31 @@ def generate_cpp_code(model, output_path):
                 f"    {var_name} = ggml_new_tensor(ctx_weights, {get_ggml_type(init.data_type)}, {len(dims)}, {var_name}_dims);"
             )
 
+        # Add to tensor map
+        cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
+
     cpp_lines.append("")
     cpp_lines.append("    // Allocate memory for weight tensors")
     cpp_lines.append("    ggml_backend_alloc_ctx_tensors(ctx_weights, backend);")
     cpp_lines.append("")
-    cpp_lines.append("    // TODO: Load weight data from file")
-    cpp_lines.append("    // Example:")
-    for init_name in list(initializers.keys())[:1]:  # Show example for first weight
-        var_name = sanitize_name(init_name)
-        cpp_lines.append(f"    // std::vector<float> {var_name}_data = {{ ... }};")
-        cpp_lines.append(
-            f"    // ggml_backend_tensor_set({var_name}, {var_name}_data.data(), 0, ggml_nbytes({var_name}));"
-        )
-        break
+    cpp_lines.append("    // Load weight data from safetensors file")
+    cpp_lines.append('    // std::cout << "Loading weights from: " << weights_file << std::endl;')
+    cpp_lines.append(
+        "    safetensors::load_from_file(weights_file, [](const std::string& key, const std::string& dtype, const std::vector<uint64_t>& shape, const std::vector<uint8_t>& tensor_data) {"
+    )
+    cpp_lines.append(
+        '        // std::cout << "Read tensor: " << key << ", size: " << tensor_data.size() << " bytes" << std::endl;'
+    )
+    cpp_lines.append("")
+    cpp_lines.append("        auto it = tensor_map.find(key);")
+    cpp_lines.append("        if (it != tensor_map.end()) {")
+    cpp_lines.append("            ggml_tensor* tensor = it->second;")
+    cpp_lines.append("            ggml_backend_tensor_set(tensor, tensor_data.data(), 0, ggml_nbytes(tensor));")
+    cpp_lines.append("        } else {")
+    cpp_lines.append('            std::cout << "Warning: Unknown tensor key: " << key << std::endl;')
+    cpp_lines.append("        }")
+    cpp_lines.append("    });")
+    cpp_lines.append('    // std::cout << "Weights loaded successfully" << std::endl;')
     cpp_lines.append("}")
     cpp_lines.append("")
 
@@ -434,12 +456,20 @@ def generate_cpp_code(model, output_path):
 
     # Generate main function
     cpp_lines.append("int main(int argc, char* argv[]) {")
+    cpp_lines.append("    // Check command line arguments")
+    cpp_lines.append("    if (argc < 2) {")
+    cpp_lines.append('        std::cerr << "Usage: " << argv[0] << " <weights_file.sft>" << std::endl;')
+    cpp_lines.append("        return 1;")
+    cpp_lines.append("    }")
+    cpp_lines.append("")
+    cpp_lines.append("    std::string weights_file = argv[1];")
+    cpp_lines.append("")
     cpp_lines.append("    // Initialize backend and allocator")
     cpp_lines.append("    init_backend();")
     cpp_lines.append("    init_mem_allocator();")
     cpp_lines.append("")
-    cpp_lines.append("    // Load model weights")
-    cpp_lines.append("    load_weights();")
+    cpp_lines.append("    // Load model weights from safetensors file")
+    cpp_lines.append("    load_weights(weights_file);")
     cpp_lines.append("")
     cpp_lines.append("    // Create sample input data")
 
@@ -511,10 +541,11 @@ def main():
         generate_cpp_code(model, output_path)
         print(f"\nSuccess! Generated: {output_path}")
         print(f"\nNext steps:")
-        print(f"  1. Implement ggml_onnx_* functions in ggml-onnx.h")
-        print(f"  2. Load weight data in load_weights() function")
-        print(f"  3. Compile with: g++ -o model {output_path} -lggml -I<ggml_include_path>")
-        print(f"  4. Run: ./model")
+        print(f"  1. Ensure safetensors.hpp is in your include path")
+        print(f"  2. Implement ggml_onnx_* functions in ggml-onnx.h")
+        print(f"  3. Export your model weights to safetensors format (e.g., model.sft)")
+        print(f"  4. Compile with: g++ -o model {output_path} -lggml -I<ggml_include_path>")
+        print(f"  5. Run: ./model <weights_file.sft>")
         return 0
     except Exception as e:
         print(f"Error generating C++ code: {e}", file=sys.stderr)
