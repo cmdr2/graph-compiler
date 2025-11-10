@@ -319,7 +319,11 @@ def generate_cpp_code(model, output_path):
 
         # Create output variable(s)
         if len(output_vars) == 1:
-            inputs_str = ", ".join(input_vars)
+            # Join input variables, but only add them if there are any
+            if input_vars:
+                inputs_str = ", " + ", ".join(input_vars)
+            else:
+                inputs_str = ""
 
             # Add attributes if any
             attrs = []
@@ -341,7 +345,7 @@ def generate_cpp_code(model, output_path):
             if attrs:
                 graph_lines.append(f'    // Attributes: {", ".join(attrs)}')
 
-            graph_lines.append(f"    ggml_tensor* {output_vars[0]} = {func_name}(ctx, {inputs_str});")
+            graph_lines.append(f"    ggml_tensor* {output_vars[0]} = {func_name}(ctx{inputs_str});")
         else:
             graph_lines.append(f"    // Multiple outputs from {op_type}")
             for out_var in output_vars:
