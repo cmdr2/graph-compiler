@@ -8,6 +8,9 @@ import argparse
 import numpy as np
 import onnxruntime as ort
 
+# Suppress ONNX Runtime warnings
+ort.set_default_logger_severity(3)  # 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
+
 
 def parse_shape(shape_str):
     """
@@ -82,7 +85,7 @@ def run_onnx_model(onnx_file, input_shape):
         if output.size <= 10:
             print(f"    Values: {output.flatten()}")
         else:
-            print(f"    First 10 values: {output.flatten()[:10]}")
+            print(f"    First 10 values: {output.flatten()[:30]}")
 
     return outputs
 
