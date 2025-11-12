@@ -28,7 +28,7 @@ def eval_node_numpy(node, inputs):
     attrs = {a.name: helper.get_attribute_value(a) for a in node.attribute}
     print(f"\nFolding operation: {op} ({node.name})")
     print(f"Input names: {node.input}")
-    print(f"Input data: {[str(i) for i in inp]}")
+    print(f"Input data: {[str(i)[:100] for i in inp]}")
 
     if op != "Shape":
         print(f"Input dtypes: {[i.dtype for i in inp]}")
@@ -41,6 +41,8 @@ def eval_node_numpy(node, inputs):
                 output = [numpy_helper.to_array(a.t)]
         if output is None:
             raise ValueError("Constant node without 'value' attribute")
+    elif op == "Identity":
+        output = [inp[0]]
     elif op == "Gather":
         # onnx Gather: data, indices, axis (attr) default 0
         data = inp[0]
@@ -183,7 +185,7 @@ def eval_node_numpy(node, inputs):
     else:
         # Not implemented op
         raise NotImplementedError(f"Op {op} not implemented in numpy evaluator")
-    print(f"Output: {output}")
+    print(f"Output: {[str(o)[:100] for o in output]}")  # Print first 100 chars to avoid huge output
     print(f"Output dtypes: {[o.dtype for o in output]}")
     return output
 
@@ -262,6 +264,8 @@ def fold_model(input_path, output_path, input_name, input_shape):
     total_shape_nodes_folded = 0
     passes = 0
     prev_graph_changed = True
+    # Track created cast outputs to avoid SSA violations
+    created_casts = {}  # Maps: original_input_name -> cast_output_name
 
     while prev_graph_changed:
         passes += 1
@@ -286,17 +290,25 @@ def fold_model(input_path, output_path, input_name, input_shape):
 
                     arr = consts[inp_name]
                     if not np.issubdtype(arr.dtype, np.integer) or arr.dtype != np.int64:
-                        print("Adding Cast node for Slice input to int64")
-                        # Create cast node
-                        cast_output = f"{inp_name}_casted_to_int64"
-                        cast_node = helper.make_node(
-                            "Cast",
-                            inputs=[inp_name],
-                            outputs=[cast_output],
-                            name=f"Cast_{inp_name}_to_int64",
-                            to=onnx.TensorProto.INT64,
-                        )
-                        new_nodes.append(cast_node)
+                        # Check if we already created a cast for this input
+                        if inp_name in created_casts:
+                            # Reuse the existing cast output
+                            cast_output = created_casts[inp_name]
+                            print(f"Reusing existing Cast output for '{inp_name}': {cast_output}")
+                        else:
+                            # Create new cast node
+                            print("Adding Cast node for Slice input to int64")
+                            cast_output = f"{inp_name}_casted_to_int64"
+                            cast_node = helper.make_node(
+                                "Cast",
+                                inputs=[inp_name],
+                                outputs=[cast_output],
+                                name=f"Cast_{inp_name}_to_int64",
+                                to=onnx.TensorProto.INT64,
+                            )
+                            new_nodes.append(cast_node)
+                            # Track this cast to avoid duplicates
+                            created_casts[inp_name] = cast_output
                         # Update the input to the Slice node
                         node.input[i] = cast_output
 
