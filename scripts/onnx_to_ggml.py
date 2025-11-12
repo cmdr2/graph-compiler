@@ -28,6 +28,14 @@ def sanitize_name(name):
     return sanitized
 
 
+def replace_diffusers_names(name):
+    name = name.replace("attentions.0.to_k", "attentions.0.key")
+    name = name.replace("attentions.0.to_q", "attentions.0.query")
+    name = name.replace("attentions.0.to_v", "attentions.0.value")
+    name = name.replace("attentions.0.to_out.0", "attentions.0.proj_attn")
+    return name
+
+
 def get_ggml_type(elem_type):
     """Map ONNX data type to ggml type."""
     type_map = {
@@ -277,6 +285,7 @@ def generate_cpp_code(model, output_path):
             cpp_lines.append(
                 f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(init.data_type)}, 1, 1, {channels}, 1);"
             )
+            init_name = replace_diffusers_names(init_name)
             cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
             continue  # Skip the normal dimension handling below
         else:
@@ -306,6 +315,7 @@ def generate_cpp_code(model, output_path):
             )
 
         # Add to tensor map
+        init_name = replace_diffusers_names(init_name)
         cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
 
     # Process constant tensors
@@ -337,6 +347,7 @@ def generate_cpp_code(model, output_path):
             )
 
         # Add to tensor map
+        const_name = replace_diffusers_names(const_name)
         cpp_lines.append(f'    tensor_map["{const_name}"] = {var_name};')
 
     cpp_lines.append("")
