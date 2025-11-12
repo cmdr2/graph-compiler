@@ -93,6 +93,70 @@ def generate_cpp_code(model, output_path):
                                 channels,
                             )
 
+    # Track constants that should be converted to tensors
+    # These are constants used as inputs to specific operators
+    constant_tensors = {}  # Maps: constant_name -> (dims, data_type, values)
+
+    # Operators whose constant inputs should become tensors
+    operators_with_tensor_constants = {"InstanceNormalization", "Mul", "Div", "Add", "Sub", "RandomNormalLike"}
+
+    # First pass: identify Constant nodes and extract their values
+    constant_node_outputs = {}  # Maps: output_name -> node
+    for node in graph.node:
+        if node.op_type == "Constant":
+            if len(node.output) > 0:
+                const_name = node.output[0]
+                constant_node_outputs[const_name] = node
+
+    # Second pass: determine which constants are used by target operators
+    constants_used_by_target_ops = set()
+    for node in graph.node:
+        if node.op_type in operators_with_tensor_constants:
+            for inp in node.input:
+                if inp in constant_node_outputs:
+                    constants_used_by_target_ops.add(inp)
+
+    # Third pass: process Constant nodes to extract constant tensors
+    for node in graph.node:
+        if node.op_type == "Constant":
+            if len(node.output) > 0:
+                const_name = node.output[0]
+                should_be_tensor = const_name in constants_used_by_target_ops
+
+                # Look for 'value' attribute
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        if attr.type == onnx.AttributeProto.TENSOR:
+                            # Extract tensor data
+                            tensor = attr.t
+                            data_type = tensor.data_type
+                            dims = list(tensor.dims)
+
+                            # Get the actual values
+                            if data_type == 1:  # FLOAT
+                                if tensor.float_data:
+                                    values = list(tensor.float_data)
+                                else:
+                                    values = list(numpy_helper.to_array(tensor).flatten())
+                            elif data_type in [6, 7]:  # INT32, INT64
+                                if tensor.int64_data:
+                                    values = list(tensor.int64_data)
+                                elif tensor.int32_data:
+                                    values = list(tensor.int32_data)
+                                else:
+                                    values = list(numpy_helper.to_array(tensor).flatten())
+                            else:
+                                values = list(numpy_helper.to_array(tensor).flatten())
+
+                            # If this constant is used by target operators, convert to tensor
+                            # Note: scalars (dims=[]) should be converted to 1D tensors with single element
+                            if should_be_tensor:
+                                if len(dims) == 0:
+                                    # Scalar: convert to 1D tensor with single element
+                                    constant_tensors[const_name] = ([1], data_type, values)
+                                else:
+                                    constant_tensors[const_name] = (dims, data_type, values)
+
     # Determine output paths
     from pathlib import Path
 
@@ -138,11 +202,18 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("ggml_context* ctx_weights = NULL;")
     cpp_lines.append("")
 
+    # Merge constant tensors into initializers for unified handling
+    # We'll add them to initializers dict but track them separately for data initialization
+    all_tensors_to_declare = list(initializers.keys()) + list(constant_tensors.keys())
+
+    # print("Initializers: ", initializers.keys())
+    # print("Constants: ", constant_tensors.keys())
+
     # Add weight tensor declarations in cpp file and extern declarations in header
-    if initializers:
+    if all_tensors_to_declare:
         cpp_lines.append("// Weight tensors")
         graph_lines.append("// External weight tensor declarations")
-        for init_name in initializers.keys():
+        for init_name in all_tensors_to_declare:
             var_name = sanitize_name(init_name)
             cpp_lines.append(f"ggml_tensor* {var_name} = NULL;")
             graph_lines.append(f"extern ggml_tensor* {var_name};")
@@ -180,7 +251,7 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("// Load model weights and constants")
     cpp_lines.append("void load_weights(const std::string& weights_file) {")
     cpp_lines.append(f"    // Create context for weights")
-    cpp_lines.append(f"    int num_weight_tensors = {len(initializers)};")
+    cpp_lines.append(f"    int num_weight_tensors = {len(all_tensors_to_declare)};")
     cpp_lines.append("    ctx_weights = ggml_init({")
     cpp_lines.append("        /*.mem_size   =*/ ggml_tensor_overhead() * num_weight_tensors,")
     cpp_lines.append("        /*.mem_buffer =*/ NULL,")
@@ -189,6 +260,7 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("")
     cpp_lines.append("    // Define weight tensors and populate tensor map")
 
+    # Process regular initializers
     for init_name in initializers.keys():
         var_name = sanitize_name(init_name)
         init = initializers[init_name]
@@ -236,10 +308,67 @@ def generate_cpp_code(model, output_path):
         # Add to tensor map
         cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
 
+    # Process constant tensors
+    for const_name, (dims, data_type, values) in constant_tensors.items():
+        var_name = sanitize_name(const_name)
+        cpp_lines.append(f"    // {const_name} - Constant tensor")
+
+        if len(dims) == 1:
+            cpp_lines.append(
+                f"    {var_name} = ggml_new_tensor_1d(ctx_weights, {get_ggml_type(data_type)}, {dims[0]});"
+            )
+        elif len(dims) == 2:
+            cpp_lines.append(
+                f"    {var_name} = ggml_new_tensor_2d(ctx_weights, {get_ggml_type(data_type)}, {dims[1]}, {dims[0]});"
+            )
+        elif len(dims) == 3:
+            cpp_lines.append(
+                f"    {var_name} = ggml_new_tensor_3d(ctx_weights, {get_ggml_type(data_type)}, {dims[2]}, {dims[1]}, {dims[0]});"
+            )
+        elif len(dims) == 4:
+            cpp_lines.append(
+                f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(data_type)}, {dims[3]}, {dims[2]}, {dims[1]}, {dims[0]});"
+            )
+        else:
+            dims_str = ", ".join(map(str, dims))
+            cpp_lines.append(f"    int64_t {var_name}_dims[] = {{{dims_str}}};")
+            cpp_lines.append(
+                f"    {var_name} = ggml_new_tensor(ctx_weights, {get_ggml_type(data_type)}, {len(dims)}, {var_name}_dims);"
+            )
+
+        # Add to tensor map
+        cpp_lines.append(f'    tensor_map["{const_name}"] = {var_name};')
+
     cpp_lines.append("")
     cpp_lines.append("    // Allocate memory for weight tensors")
     cpp_lines.append("    ggml_backend_alloc_ctx_tensors(ctx_weights, backend);")
     cpp_lines.append("")
+
+    # Initialize constant tensor values
+    if constant_tensors:
+        cpp_lines.append("    // Initialize constant tensor values")
+        for const_name, (dims, data_type, values) in constant_tensors.items():
+            var_name = sanitize_name(const_name)
+
+            # Generate array of values
+            if data_type == 1:  # FLOAT
+                vals_str = ", ".join([f"{v}f" for v in values])
+                cpp_lines.append(f"    {{")
+                cpp_lines.append(f"        float {var_name}_data[] = {{{vals_str}}};")
+                cpp_lines.append(
+                    f"        ggml_backend_tensor_set({var_name}, {var_name}_data, 0, sizeof({var_name}_data));"
+                )
+                cpp_lines.append(f"    }}")
+            elif data_type in [6, 7]:  # INT32, INT64
+                vals_str = ", ".join([str(int(v)) for v in values])
+                cpp_lines.append(f"    {{")
+                cpp_lines.append(f"        int32_t {var_name}_data[] = {{{vals_str}}};")
+                cpp_lines.append(
+                    f"        ggml_backend_tensor_set({var_name}, {var_name}_data, 0, sizeof({var_name}_data));"
+                )
+                cpp_lines.append(f"    }}")
+        cpp_lines.append("")
+
     cpp_lines.append("    // Load weight data from safetensors file")
     cpp_lines.append('    // std::cout << "Loading weights from: " << weights_file << std::endl;')
     cpp_lines.append(
@@ -274,14 +403,14 @@ def generate_cpp_code(model, output_path):
         tensor_vars[input_name] = var_name
         if var_name != "input":
             graph_lines.append(f"    // Input: {input_name}")
-            graph_lines.append(f"    ggml_tensor* {var_name} = input;")
+            graph_lines.append(f"    auto {var_name} = input;")
             graph_lines.append("")
     else:
         graph_lines.append("    // TODO: Handle multiple inputs")
         for i, (input_name, inp) in enumerate(inputs.items()):
             var_name = sanitize_name(input_name)
             tensor_vars[input_name] = var_name
-            graph_lines.append(f"    ggml_tensor* {var_name} = input; // {input_name}")
+            graph_lines.append(f"    auto {var_name} = input; // {input_name}")
         graph_lines.append("")
 
     # Reference weight tensors (already created globally)
@@ -289,11 +418,110 @@ def generate_cpp_code(model, output_path):
         var_name = sanitize_name(init_name)
         tensor_vars[init_name] = var_name
 
+    # Reference constant tensors that were converted to weight tensors
+    for const_name in constant_tensors.keys():
+        var_name = sanitize_name(const_name)
+        tensor_vars[const_name] = var_name
+
+    # Track constant values (not tensors)
+    constant_values = {}  # Maps: constant_name -> (type, value_str, value_data)
+
+    # Fourth pass: process Constant nodes for inline constants (not converted to tensors)
+    for node in graph.node:
+        if node.op_type == "Constant":
+            if len(node.output) > 0:
+                const_name = node.output[0]
+
+                # Skip if already converted to tensor
+                if const_name in constant_tensors:
+                    continue
+
+                # Look for 'value' attribute
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        if attr.type == onnx.AttributeProto.TENSOR:
+                            # Extract tensor data
+                            tensor = attr.t
+                            data_type = tensor.data_type
+                            dims = list(tensor.dims)
+
+                            # Get the actual values
+                            if data_type == 1:  # FLOAT
+                                if tensor.float_data:
+                                    values = list(tensor.float_data)
+                                else:
+                                    values = list(numpy_helper.to_array(tensor).flatten())
+                            elif data_type in [6, 7]:  # INT32, INT64
+                                if tensor.int64_data:
+                                    values = list(tensor.int64_data)
+                                elif tensor.int32_data:
+                                    values = list(tensor.int32_data)
+                                else:
+                                    values = list(numpy_helper.to_array(tensor).flatten())
+                            else:
+                                values = list(numpy_helper.to_array(tensor).flatten())
+
+                            # Determine C++ type and value based on shape
+                            # If dims is empty (scalar) or not present, create scalar constant
+                            # If dims is present (even [1]), create vector constant
+                            if len(dims) == 0:
+                                # True scalar constant (no shape)
+                                if data_type == 1:  # FLOAT
+                                    const_type = "float"
+                                    value_str = f"{values[0]}f"
+                                elif data_type in [6, 7]:  # INT32, INT64
+                                    const_type = "int64_t"
+                                    value_str = f"{int(values[0])}"
+                                else:
+                                    const_type = "float"
+                                    value_str = f"{float(values[0])}f"
+                                constant_values[const_name] = (const_type, value_str, values[0])
+                            else:
+                                # Vector/array constant (has shape, even if shape is [1])
+                                if data_type == 1:  # FLOAT
+                                    const_type = "std::vector<float>"
+                                    vals_str = ", ".join([f"{v}f" for v in values])
+                                elif data_type in [6, 7]:  # INT32, INT64
+                                    const_type = "std::vector<int64_t>"
+                                    vals_str = ", ".join([str(int(v)) for v in values])
+                                else:
+                                    const_type = "std::vector<float>"
+                                    vals_str = ", ".join([f"{float(v)}f" for v in values])
+                                value_str = f"{{{vals_str}}}"
+                                constant_values[const_name] = (const_type, value_str, values)
+                    elif attr.name == "value_float":
+                        const_type = "float"
+                        value_str = f"{attr.f}f"
+                        constant_values[const_name] = (const_type, value_str, attr.f)
+                    elif attr.name == "value_int":
+                        const_type = "int64_t"
+                        value_str = f"{attr.i}"
+                        constant_values[const_name] = (const_type, value_str, attr.i)
+
     # Process each node in the graph
     graph_lines.append("    // Graph operations")
     for node in graph.node:
         op_type = node.op_type
         node_name = node.name if node.name else f"{op_type}_node"
+
+        # Skip Constant nodes - we generate variables for them inline or convert to tensors
+        if op_type == "Constant":
+            if len(node.output) > 0:
+                const_name = node.output[0]
+
+                # If this constant was converted to a tensor, skip it
+                if const_name in constant_tensors:
+                    continue
+
+                # Otherwise, generate inline constant
+                if const_name in constant_values:
+                    const_type, value_str, _ = constant_values[const_name]
+                    var_name = sanitize_name(const_name)
+                    graph_lines.append(f"    // Node: {node_name} (Op: {op_type})")
+                    graph_lines.append(f"    const {const_type} {var_name} = {value_str};")
+                    tensor_vars[const_name] = var_name
+                    graph_lines.append("")
+            continue
 
         graph_lines.append(f"    // Node: {node_name} (Op: {op_type})")
 
@@ -345,7 +573,7 @@ def generate_cpp_code(model, output_path):
             if attrs:
                 graph_lines.append(f'    // Attributes: {", ".join(attrs)}')
 
-            graph_lines.append(f"    ggml_tensor* {output_vars[0]} = {func_name}(ctx{inputs_str});")
+            graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str});")
         else:
             graph_lines.append(f"    // Multiple outputs from {op_type}")
             for out_var in output_vars:
@@ -547,6 +775,7 @@ def generate_cpp_code(model, output_path):
     print(f"  - Output tensors: {len(outputs)}")
     print(f"  - Operations: {len(graph.node)}")
     print(f"  - Initializers: {len(initializers)}")
+    print(f"  - Constant tensors: {len(constant_tensors)}")
 
 
 def main():
