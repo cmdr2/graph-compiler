@@ -389,6 +389,34 @@ def fold_model(input_path, output_path, input_name, input_shape):
 
         prev_graph_changed = graph_changed
 
+    # Convert Reshape nodes with 0 or -1 in shape to explicit values
+    print("\nResolving Reshape nodes with 0 or -1 in shape...")
+    reshape_nodes_fixed = 0
+    for node in model.graph.node:
+        if node.op_type == "Reshape" and len(node.input) >= 2:
+            shape_input_name = node.input[1]
+            output_shape = shapes.get(node.output[0])
+
+            # If shape input is constant and output shape is known, update it
+            if shape_input_name in consts and output_shape and all(d is not None for d in output_shape):
+                shape_array = consts[shape_input_name]
+                if 0 in shape_array or -1 in shape_array:
+                    print(
+                        f"Info: Fixing Reshape '{node.name or node.output[0]}': {shape_array.tolist()} -> {list(output_shape)}"
+                    )
+                    new_shape = np.array(output_shape, dtype=np.int64)
+                    consts[shape_input_name] = new_shape
+                    # Update the Constant node
+                    for cn in model.graph.node:
+                        if cn.op_type == "Constant" and shape_input_name in cn.output:
+                            tensor = numpy_helper.from_array(new_shape, name=shape_input_name)
+                            cn.ClearField("attribute")
+                            cn.attribute.add().CopyFrom(helper.make_attribute("value", tensor))
+                            reshape_nodes_fixed += 1
+                            break
+
+    print(f"Fixed {reshape_nodes_fixed} Reshape nodes with explicit shapes")
+
     # Remove dead nodes (constants that are no longer used)
     # Build set of all used values
     used_values = set()
