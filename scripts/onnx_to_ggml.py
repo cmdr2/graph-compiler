@@ -584,6 +584,7 @@ def generate_cpp_code(model, output_path):
             if attrs:
                 graph_lines.append(f'    // Attributes: {", ".join(attrs)}')
 
+            graph_lines.append(f'    std::cout << "Inserting {op_type} node: {node_name}\\n";')
             graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str});")
         else:
             graph_lines.append(f"    // Multiple outputs from {op_type}")
