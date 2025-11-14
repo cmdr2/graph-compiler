@@ -964,8 +964,9 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("")
     cpp_lines.append("    // Print input tensor shape for debugging")
     cpp_lines.append("    if (input) {")
-    cpp_lines.append('        fprintf(stderr, "Input tensor dims: [%lld, %lld, %lld, %lld]\\n",')
-    cpp_lines.append("                input->ne[0], input->ne[1], input->ne[2], input->ne[3]);")
+    cpp_lines.append(
+        '        std::cout << "Input tensor dims: [" << input->ne[0] << ", " << input->ne[1] << ", " << input->ne[2] << ", " << input->ne[3] << "]" << std::endl;'
+    )
     cpp_lines.append("    }")
     cpp_lines.append("")
     cpp_lines.append("    // Allocate tensors")
