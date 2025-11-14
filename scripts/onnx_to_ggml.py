@@ -564,28 +564,38 @@ def generate_cpp_code(model, output_path):
             else:
                 inputs_str = ""
 
-            # Add attributes if any
-            attrs = []
+            # Process attributes and create variables for them
+            attr_vars = []
             for attr in node.attribute:
                 attr_name = attr.name
+                attr_var_name = f"{output_vars[0]}_{attr_name}"
+
                 if attr.type == onnx.AttributeProto.INT:
-                    attrs.append(f"{attr_name}={attr.i}")
+                    graph_lines.append(f"    int64_t {attr_var_name} = {attr.i};")
+                    attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.FLOAT:
-                    attrs.append(f"{attr_name}={attr.f}")
+                    graph_lines.append(f"    float {attr_var_name} = {attr.f}f;")
+                    attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.INTS:
                     vals = ", ".join(map(str, attr.ints))
-                    attrs.append(f"{attr_name}=[{vals}]")
+                    graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals}}};")
+                    attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.FLOATS:
-                    vals = ", ".join(map(str, attr.floats))
-                    attrs.append(f"{attr_name}=[{vals}]")
+                    vals = ", ".join([f"{v}f" for v in attr.floats])
+                    graph_lines.append(f"    std::vector<float> {attr_var_name} = {{{vals}}};")
+                    attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.STRING:
-                    attrs.append(f'{attr_name}="{attr.s.decode()}"')
+                    graph_lines.append(f'    std::string {attr_var_name} = "{attr.s.decode()}";')
+                    attr_vars.append(attr_var_name)
 
-            if attrs:
-                graph_lines.append(f'    // Attributes: {", ".join(attrs)}')
+            # Add attribute variables to function call
+            if attr_vars:
+                attrs_str = ", " + ", ".join(attr_vars)
+            else:
+                attrs_str = ""
 
             graph_lines.append(f'    std::cout << "Inserting {op_type} node: {node_name}\\n";')
-            graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str});")
+            graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str}{attrs_str});")
         else:
             graph_lines.append(f"    // Multiple outputs from {op_type}")
             for out_var in output_vars:
