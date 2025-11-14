@@ -7,6 +7,9 @@ Accepts an ONNX file and input shape, then runs inference.
 import argparse
 import numpy as np
 import onnxruntime as ort
+import onnx
+import tempfile
+import os
 
 # Suppress ONNX Runtime warnings
 ort.set_default_logger_severity(3)  # 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
@@ -30,18 +33,23 @@ def parse_shape(shape_str):
         ) from e
 
 
-def run_onnx_model(onnx_file, input_shape):
+def run_onnx_model(onnx_file, input_shape, print_values=False):
     """
     Run an ONNX model with zero-filled input.
 
     Args:
         onnx_file: Path to the ONNX model file
         input_shape: Tuple representing the shape of the input tensor
+        print_values: Whether to print intermediate tensor values
     """
     print(f"Loading ONNX model from: {onnx_file}")
 
     # Create an ONNX Runtime session
-    session = ort.InferenceSession(onnx_file, providers=["CPUExecutionProvider"])
+    sess_options = ort.SessionOptions()
+    if print_values:
+        # Enable intermediate outputs for printing
+        sess_options.enable_profiling = False
+    session = ort.InferenceSession(onnx_file, sess_options=sess_options, providers=["CPUExecutionProvider"])
 
     # Print model information
     print("\nModel Information:")
@@ -68,7 +76,89 @@ def run_onnx_model(onnx_file, input_shape):
 
     # Run inference
     print("\nRunning inference...")
-    outputs = session.run(None, {input_name: input_data})
+
+    if print_values:
+        # Load the ONNX model and add intermediate outputs
+        model = onnx.load(onnx_file)
+
+        # Run shape inference to get type information for all tensors
+        print("\nInferring shapes and types for intermediate tensors...")
+        try:
+            model = onnx.shape_inference.infer_shapes(model)
+        except Exception as e:
+            print(f"Warning: Shape inference failed: {e}")
+            print("Proceeding without full type information...")
+
+        # Collect all intermediate tensor names (outputs of each node)
+        intermediate_names = []
+        for node in model.graph.node:
+            for output in node.output:
+                intermediate_names.append(output)
+
+        # Get original output names
+        original_output_names = [out.name for out in model.graph.output]
+
+        # Add intermediate tensors as model outputs
+        print(f"Adding {len(intermediate_names)} intermediate outputs to model...")
+
+        # Build a lookup of tensor name to type info
+        tensor_type_map = {}
+        for vi in model.graph.value_info:
+            tensor_type_map[vi.name] = vi
+        for inp in model.graph.input:
+            tensor_type_map[inp.name] = inp
+        for out in model.graph.output:
+            tensor_type_map[out.name] = out
+
+        # Add intermediate tensors as outputs
+        for intermediate_name in intermediate_names:
+            if intermediate_name not in original_output_names:
+                # Check if we already have this as an output
+                already_output = any(out.name == intermediate_name for out in model.graph.output)
+                if not already_output:
+                    if intermediate_name in tensor_type_map:
+                        # Use the existing type information
+                        model.graph.output.append(tensor_type_map[intermediate_name])
+                    else:
+                        # Fallback: create without type info (let ONNX infer it)
+                        new_output = onnx.helper.make_empty_tensor_value_info(intermediate_name)
+                        model.graph.output.append(new_output)
+
+        # Save modified model to a temporary location
+        temp_model_path = os.path.join(tempfile.gettempdir(), "temp_model_with_intermediates.onnx")
+        onnx.save(model, temp_model_path)
+
+        # Create new session with modified model
+        session_with_intermediates = ort.InferenceSession(
+            temp_model_path, sess_options=sess_options, providers=["CPUExecutionProvider"]
+        )
+
+        # Run inference with all outputs
+        all_outputs = session_with_intermediates.run(None, {input_name: input_data})
+        all_output_names = [out.name for out in session_with_intermediates.get_outputs()]
+
+        # Print intermediate values
+        print("\nIntermediate Tensor Values:")
+        print("=" * 80)
+        for name, output in zip(all_output_names, all_outputs):
+            if output is not None:
+                flattened = output.flatten()
+                num_elements = min(10, len(flattened))
+                print(f"\n{name}:")
+                print(f"  Shape: {output.shape}, Type: {output.dtype}")
+                print(f"  First {num_elements} values: {flattened[:num_elements]}")
+        print("=" * 80)
+
+        # Clean up temp file
+        try:
+            os.remove(temp_model_path)
+        except:
+            pass
+
+        # Extract only original outputs
+        outputs = [all_outputs[all_output_names.index(name)] for name in original_output_names]
+    else:
+        outputs = session.run(None, {input_name: input_data})
 
     # Print outputs
     print("\nInference Results:")
@@ -98,6 +188,7 @@ def main():
 Examples:
   %(prog)s model.onnx --input-shape 1,3,224,224
   %(prog)s vae_folded.onnx --input-shape 1,4,64,64
+  %(prog)s model.onnx --input-shape 1,3,224,224 --print-values
         """,
     )
 
@@ -110,6 +201,12 @@ Examples:
         help='Shape of the input tensor as comma-separated integers (e.g., "1,3,224,224")',
     )
 
+    parser.add_argument(
+        "--print-values",
+        action="store_true",
+        help="Print first 10 elements of each intermediate tensor during execution",
+    )
+
     args = parser.parse_args()
 
     # Parse the input shape
@@ -120,10 +217,10 @@ Examples:
 
     # Run the model
     try:
-        run_onnx_model(args.onnx_file, input_shape)
-        print("\n✓ Inference completed successfully!")
+        run_onnx_model(args.onnx_file, input_shape, print_values=args.print_values)
+        print("\nInference completed successfully!")
     except Exception as e:
-        print(f"\n✗ Error running model: {e}")
+        print(f"\nError running model: {e}")
         raise
 
 
