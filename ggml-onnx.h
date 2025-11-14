@@ -144,7 +144,25 @@ static inline ggml_tensor* ggml_onnx_gemm(ggml_context* ctx, ggml_tensor* a, ggm
 static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
     print_shape(a, "a");
     print_shape(b, "b");
-    ggml_tensor* result = ggml_mul_mat(ctx, b, a);
+
+    // ONNX MatMul: C = A @ B
+    // For ONNX A[M,K] @ B[K,N] = C[M,N]:
+    //   - GGML representation: a.ne=[K,M,1,1], b.ne=[N,K,1,1] (dimensions are reversed)
+    //
+    // ggml_mul_mat(x, y) computes x^T @ y with:
+    //   - Constraint: x->ne[0] == y->ne[0] (shared dimension)
+    //   - Result shape: [x->ne[1], y->ne[1], y->ne[2], y->ne[3]]
+    //
+    // To compute A @ B:
+    //   - Transpose b: b^T.ne = [K,N,1,1]
+    //   - Call ggml_mul_mat(a, b^T) requires a.ne[0]==b^T.ne[0], i.e., K==K ✓
+    //   - Result shape: [a.ne[1], b^T.ne[1], 1, 1] = [M, N, 1, 1] ✓
+
+    // Transpose b to match dimensions for ggml_mul_mat
+    ggml_tensor* b_t = ggml_cont(ctx, ggml_transpose(ctx, b));
+    print_shape(b_t, "b_transposed");
+
+    ggml_tensor* result = ggml_mul_mat(ctx, a, b_t);
     print_shape(result, "output");
     return result;
 }
@@ -153,7 +171,24 @@ static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, g
 static inline ggml_tensor* ggml_onnx_add(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
     print_shape(a, "a");
     print_shape(b, "b");
-    ggml_tensor* result = ggml_add(ctx, a, b);
+
+    // GGML expects the larger tensor first for broadcasting
+    // Determine which tensor is larger by comparing total elements
+    int64_t size_a = 1;
+    int64_t size_b = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        size_a *= a->ne[i];
+        size_b *= b->ne[i];
+    }
+
+    // If b is larger, swap them for ggml_add
+    ggml_tensor* result;
+    if (size_b > size_a) {
+        result = ggml_add(ctx, b, a);
+    } else {
+        result = ggml_add(ctx, a, b);
+    }
+
     print_shape(result, "output");
     return result;
 }
@@ -172,7 +207,24 @@ static inline ggml_tensor* ggml_onnx_mul(ggml_context* ctx, ggml_tensor* a, ggml
     // print the shapes of a and b
     print_shape(a, "a");
     print_shape(b, "b");
-    ggml_tensor* result = ggml_mul(ctx, a, b);
+
+    // GGML expects the larger tensor first for broadcasting
+    // Determine which tensor is larger by comparing total elements
+    int64_t size_a = 1;
+    int64_t size_b = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        size_a *= a->ne[i];
+        size_b *= b->ne[i];
+    }
+
+    // If b is larger, swap them for ggml_mul (multiplication is commutative)
+    ggml_tensor* result;
+    if (size_b > size_a) {
+        result = ggml_mul(ctx, b, a);
+    } else {
+        result = ggml_mul(ctx, a, b);
+    }
+
     print_shape(result, "output");
     return result;
 }
@@ -284,12 +336,114 @@ static inline ggml_tensor* ggml_onnx_averagepool(ggml_context* ctx, ggml_tensor*
 static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* input,
                                                const std::vector<int64_t>& perm = {}) {
     print_shape(input, "input");
-    // Note: perm parameter specifies the permutation of axes
-    // ggml_transpose only swaps the last two dimensions, so perm is kept for API compatibility
-    (void)perm;  // Unused for now
 
-    // Transpose last two dimensions (matrix transpose)
-    ggml_tensor* result = ggml_transpose(ctx, input);
+    // print perm
+    std::cout << "Transpose perm: ";
+    for (size_t i = 0; i < perm.size(); i++) {
+        std::cout << perm[i] << " ";
+    }
+    std::cout << std::endl;
+
+    int ndims = ggml_n_dims(input);
+
+    // Handle empty perm - no transpose needed
+    if (perm.empty()) {
+        print_shape(input, "output");
+        return input;
+    }
+
+    // GGML tensors always have 4 dimensions in ne[], but ggml_n_dims may return less
+    // if trailing dimensions are 1. For transpose, we need to work with the actual
+    // number of dimensions that ONNX expects (from perm size).
+    int perm_size = perm.size();
+
+    // Use perm_size as the actual rank since that's what ONNX thinks it is
+    int actual_ndims = perm_size;
+
+    // No need to reshape - GGML tensors already have 4 dimensions in ne[]
+    // We just need to respect that ONNX is working with actual_ndims dimensions
+    ggml_tensor* working_input = input;
+
+    // Build full ONNX permutation by extending with identity for missing dims (up to 4)
+    // When perm_size < 4, the perm applies to the TRAILING dimensions in ONNX
+    // When perm_size == 4, use the perm directly (full 4D permutation)
+    std::vector<int64_t> full_onnx_perm(4);
+
+    if (perm_size == 4) {
+        // Full 4D permutation - use as-is
+        for (int i = 0; i < 4; i++) {
+            full_onnx_perm[i] = perm[i];
+        }
+    } else {
+        // Partial permutation - applies to trailing dimensions
+        int offset = 4 - perm_size;  // How many leading dims to keep as identity
+        for (int i = 0; i < 4; i++) {
+            if (i < offset) {
+                // Leading dimensions not covered by perm - keep identity
+                full_onnx_perm[i] = i;
+            } else {
+                // Apply the perm to the trailing dimensions
+                int perm_idx = i - offset;
+                full_onnx_perm[i] = offset + perm[perm_idx];
+            }
+        }
+    }
+
+    // ONNX perm is in ONNX dimension order [N, C, H, W]
+    // GGML uses reversed order [W, H, C, N]
+    // We need to convert the permutation to GGML order
+    //
+    // ONNX semantics: output[i] = input[perm[i]]
+    // GGML ggml_permute semantics: output[axis[i]] = input[i]
+    // So we need to compute the inverse permutation in GGML order
+    //
+    // First, convert ONNX perm to GGML coordinate system
+    // Then compute the inverse
+    std::vector<int64_t> onnx_perm_in_ggml(4);
+    for (int i = 0; i < 4; i++) {
+        int onnx_idx = 3 - i;                     // Map GGML position to ONNX position
+        int onnx_src = full_onnx_perm[onnx_idx];  // ONNX says output[onnx_idx] = input[onnx_src]
+        onnx_perm_in_ggml[i] = 3 - onnx_src;      // Convert src to GGML coordinate
+    }
+
+    // Now compute inverse: if onnx_perm_in_ggml[i] = j, then inverse[j] = i
+    std::vector<int64_t> ggml_perm(4);
+    for (int i = 0; i < 4; i++) {
+        int j = onnx_perm_in_ggml[i];
+        ggml_perm[j] = i;
+    }
+
+    // Check if this is actually an identity permutation
+    bool is_identity = true;
+    for (int i = 0; i < 4; i++) {
+        if (ggml_perm[i] != i) {
+            is_identity = false;
+            break;
+        }
+    }
+
+    if (is_identity) {
+        print_shape(working_input, "output");
+        return working_input;
+    }
+
+    // Use ggml_permute for arbitrary permutations
+    // ggml_permute always takes 4 axis indices
+    int axis0 = ggml_perm[0];
+    int axis1 = ggml_perm[1];
+    int axis2 = ggml_perm[2];
+    int axis3 = ggml_perm[3];
+
+    std::cout << "Transpose: ONNX perm size=" << perm_size << ", ggml_n_dims=" << ndims
+              << ", actual_ndims=" << actual_ndims << ", GGML axes=[" << axis0 << "," << axis1 << "," << axis2 << ","
+              << axis3 << "]" << std::endl;
+
+    ggml_tensor* result = ggml_permute(ctx, working_input, axis0, axis1, axis2, axis3);
+
+    // ggml_permute creates a view with transposed strides, but many operations require
+    // a contiguous tensor. Use ggml_cont to make it contiguous.
+    result = ggml_cont(ctx, result);
+
     print_shape(result, "output");
     return result;
 }
@@ -349,6 +503,16 @@ static inline ggml_tensor* ggml_onnx_slice(ggml_context* ctx, ggml_tensor* input
                                            const std::vector<int64_t>& ends, const std::vector<int64_t>& axes = {},
                                            const std::vector<int64_t>& steps = {}) {
     print_shape(input, "input");
+    std::cout << "starts: ";
+    for (auto s : starts) std::cout << std::to_string(s) + " ";
+    std::cout << "\nends: ";
+    for (auto e : ends) std::cout << std::to_string(e) + " ";
+    std::cout << "\naxes: ";
+    for (auto a : axes) std::cout << std::to_string(a) + " ";
+    std::cout << "\nsteps: ";
+    for (auto st : steps) std::cout << std::to_string(st) + " ";
+    std::cout << "\n";
+
     int r = ggml_n_dims(input);  // rank of input
 
     // Get dimension sizes
@@ -358,6 +522,7 @@ static inline ggml_tensor* ggml_onnx_slice(ggml_context* ctx, ggml_tensor* input
     }
 
     // Compute effective slice parameters
+    // Note: axes should already be in GGML order if coming from the code generator
     std::vector<int64_t> eff_starts, eff_ends, eff_steps;
     ggml_onnx_compute_slice_params(r, dim_sizes, starts, ends, axes, steps, eff_starts, eff_ends, eff_steps);
 
@@ -754,24 +919,55 @@ static inline ggml_tensor* ggml_onnx_squeeze(ggml_context* ctx, ggml_tensor* inp
 }
 
 // Pad - Pad tensor
-// Accepts a vector of padding values [p0, p1, p2, p3]
-// If constant_value is provided, it specifies the padding value (note: ggml_pad doesn't support this yet)
+// ONNX pads format: [x1_begin, x2_begin, ..., xn_begin, x1_end, x2_end, ..., xn_end]
+// For 4D: [dim0_begin, dim1_begin, dim2_begin, dim3_begin, dim0_end, dim1_end, dim2_end, dim3_end]
+// ONNX dimensions are [N, C, H, W], GGML dimensions are [W, H, C, N] (reversed)
 static inline ggml_tensor* ggml_onnx_pad(ggml_context* ctx, ggml_tensor* input, const std::vector<int64_t>& pads,
                                          float constant_value = 0.0f, const std::string& mode = "constant") {
     print_shape(input, "input");
 
-    // Ensure we have at least 4 padding values (pad with zeros if needed)
-    int p0 = pads.size() > 0 ? pads[0] : 0;
-    int p1 = pads.size() > 1 ? pads[1] : 0;
-    int p2 = pads.size() > 2 ? pads[2] : 0;
-    int p3 = pads.size() > 3 ? pads[3] : 0;
+    // Note: constant_value and mode would need custom implementation
+    (void)constant_value;  // Unused for now (ggml_pad uses 0)
+    (void)mode;            // Unused for now (ggml_pad uses constant mode)
 
-    // Note: ggml_pad doesn't support custom padding values or modes, but we include the parameters for API
-    // compatibility The constant_value and mode would need to be applied in a post-processing step if needed
-    (void)constant_value;  // Unused for now
-    (void)mode;            // Unused for now
+    int ndims = ggml_n_dims(input);
 
-    ggml_tensor* result = ggml_pad(ctx, input, p0, p1, p2, p3);
+    if (pads.empty()) {
+        print_shape(input, "output");
+        return input;
+    }
+
+    // ONNX pads are split: first half is "begin", second half is "end"
+    int half_size = pads.size() / 2;
+
+    // Extract begin and end padding for each ONNX dimension
+    std::vector<int> onnx_begin(half_size, 0);
+    std::vector<int> onnx_end(half_size, 0);
+
+    for (int i = 0; i < half_size; i++) {
+        onnx_begin[i] = pads[i];
+        onnx_end[i] = pads[half_size + i];
+    }
+
+    // Normalize to 4D if needed (ONNX typically uses 4D for image tensors)
+    while (onnx_begin.size() < 4) {
+        onnx_begin.insert(onnx_begin.begin(), 0);
+        onnx_end.insert(onnx_end.begin(), 0);
+    }
+
+    // Convert from ONNX order [N, C, H, W] to GGML order [W, H, C, N]
+    // ONNX: [dim0_begin, dim1_begin, dim2_begin, dim3_begin]
+    // GGML: [dim3_begin, dim2_begin, dim1_begin, dim0_begin] (reversed)
+    int lp0 = onnx_begin[3];  // W dimension
+    int rp0 = onnx_end[3];
+    int lp1 = onnx_begin[2];  // H dimension
+    int rp1 = onnx_end[2];
+    int lp2 = onnx_begin[1];  // C dimension
+    int rp2 = onnx_end[1];
+    int lp3 = onnx_begin[0];  // N dimension
+    int rp3 = onnx_end[0];
+
+    ggml_tensor* result = ggml_pad_ext(ctx, input, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
     print_shape(result, "output");
     return result;
 }

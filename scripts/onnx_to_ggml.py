@@ -50,6 +50,13 @@ def get_ggml_type(elem_type):
     return type_map.get(elem_type, "GGML_TYPE_F32")
 
 
+def normalize_dims_to_4d(dims):
+    if len(dims) >= 4:
+        return dims
+    # Prepend 1s to make it 4D
+    return [1] * (4 - len(dims)) + dims
+
+
 def generate_cpp_code(model, output_path):
     """Generate C++ code from ONNX model.
 
@@ -69,8 +76,96 @@ def generate_cpp_code(model, output_path):
     # Maps: initializer_name -> (op_type, role, required_shape_in_ggml_order)
     reshape_info = {}
 
+    # Track Conv weights that need dimension reversal
+    # Maps: weight_name -> (op_type, role, original_dims)
+    conv_weights = {}
+
+    # Track Reshape shape tensors that need dimension reversal
+    # Maps: shape_tensor_name -> (op_type, role, original_dims)
+    reshape_shapes = {}
+
+    # Track Unsqueeze/Squeeze axes tensors that need axis conversion
+    # Maps: axes_tensor_name -> (op_type, input_tensor_name)
+    unsqueeze_squeeze_axes = {}
+
+    # Track Slice axes tensors that need axis conversion
+    # Maps: axes_tensor_name -> (op_type, input_tensor_name)
+    slice_axes = {}
+
+    # Build a map of tensor names to their shapes (in ONNX order) for rank calculation
+    # We'll populate this from initializers and graph value_info
+    tensor_shapes = {}
+
+    # Add initializer shapes
+    for init_name, init in initializers.items():
+        tensor_shapes[init_name] = list(init.dims)
+
+    # Add graph input shapes
+    for input_info in graph.input:
+        if input_info.name not in tensor_shapes:  # Don't override initializers
+            shape = []
+            if input_info.type.HasField("tensor_type"):
+                tensor_type = input_info.type.tensor_type
+                if tensor_type.HasField("shape"):
+                    for dim in tensor_type.shape.dim:
+                        if dim.HasField("dim_value"):
+                            shape.append(dim.dim_value)
+                        else:
+                            shape.append(-1)  # Dynamic dimension
+            if shape:
+                tensor_shapes[input_info.name] = shape
+
+    # Add shapes from value_info (intermediate tensors)
+    for value_info in graph.value_info:
+        if value_info.name not in tensor_shapes:
+            shape = []
+            if value_info.type.HasField("tensor_type"):
+                tensor_type = value_info.type.tensor_type
+                if tensor_type.HasField("shape"):
+                    for dim in tensor_type.shape.dim:
+                        if dim.HasField("dim_value"):
+                            shape.append(dim.dim_value)
+                        else:
+                            shape.append(-1)  # Dynamic dimension
+            if shape:
+                tensor_shapes[value_info.name] = shape
+
     for node in graph.node:
         op_type = node.op_type
+
+        # Conv: weight (1st input after input) needs dimension reversal
+        # ONNX Conv weight: [out_channels, in_channels, kH, kW]
+        # GGML Conv weight: [kW, kH, in_channels, out_channels]
+        if op_type == "Conv" and len(node.input) >= 2 and node.input[1]:
+            weight_name = node.input[1]
+            if weight_name in initializers:
+                init = initializers[weight_name]
+                if len(init.dims) == 4:  # Conv2D weight should be 4D
+                    conv_weights[weight_name] = ("Conv", "weight", list(init.dims))
+
+        # Reshape: shape tensor (2nd input) needs dimension reversal
+        # ONNX shape: [N, C, H, W] -> GGML shape: [W, H, C, N]
+        if op_type == "Reshape" and len(node.input) >= 2 and node.input[1]:
+            shape_name = node.input[1]
+            if shape_name in initializers:
+                init = initializers[shape_name]
+                # Shape is a 1D tensor containing the target dimensions
+                if len(init.dims) == 1:
+                    reshape_shapes[shape_name] = ("Reshape", "shape", list(init.dims))
+
+        # Unsqueeze/Squeeze: axes tensor (2nd input) needs axis position conversion
+        # ONNX axes refer to output positions, need to convert to GGML order
+        if op_type in ["Unsqueeze", "Squeeze"] and len(node.input) >= 2 and node.input[1]:
+            axes_name = node.input[1]
+            input_name = node.input[0]
+            unsqueeze_squeeze_axes[axes_name] = (op_type, input_name)
+
+        # Slice: axes tensor (4th input) needs axis position conversion
+        # ONNX axes refer to positions in ONNX order, need to convert to GGML order
+        if op_type == "Slice" and len(node.input) >= 4 and node.input[3]:
+            axes_name = node.input[3]
+            input_name = node.input[0]
+            slice_axes[axes_name] = (op_type, input_name)
 
         # Conv: 3rd input (bias) needs reshaping from [C] to [1, 1, C, 1] in ONNX/logical order
         # ONNX order is [N, C, H, W], so [1, C, 1, 1] means N=1, C=channels, H=1, W=1
@@ -118,11 +213,24 @@ def generate_cpp_code(model, output_path):
 
     # Second pass: determine which constants are used by target operators
     constants_used_by_target_ops = set()
+    constants_used_as_reshape_shapes = set()  # Track constants used as Reshape shape inputs
+    constants_used_as_slice_axes = {}  # Track constants used as Slice axes: name -> input_tensor_name
     for node in graph.node:
         if node.op_type in operators_with_tensor_constants:
             for inp in node.input:
                 if inp in constant_node_outputs:
                     constants_used_by_target_ops.add(inp)
+        # Track constants used as Reshape shape (2nd input)
+        if node.op_type == "Reshape" and len(node.input) >= 2 and node.input[1]:
+            shape_input = node.input[1]
+            if shape_input in constant_node_outputs:
+                constants_used_as_reshape_shapes.add(shape_input)
+        # Track constants used as Slice axes (4th input)
+        if node.op_type == "Slice" and len(node.input) >= 4 and node.input[3]:
+            axes_input = node.input[3]
+            input_tensor = node.input[0]
+            if axes_input in constant_node_outputs:
+                constants_used_as_slice_axes[axes_input] = input_tensor
 
     # Third pass: process Constant nodes to extract constant tensors
     for node in graph.node:
@@ -272,7 +380,7 @@ def generate_cpp_code(model, output_path):
     for init_name in initializers.keys():
         var_name = sanitize_name(init_name)
         init = initializers[init_name]
-        dims = list(init.dims)
+        dims = list(init.dims)  # ONNX dimension order
 
         # Check if this initializer needs reshaping for broadcasting
         if init_name in reshape_info:
@@ -288,31 +396,49 @@ def generate_cpp_code(model, output_path):
             init_name = replace_diffusers_names(init_name)
             cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
             continue  # Skip the normal dimension handling below
-        else:
-            cpp_lines.append(f"    // {init_name}")
-
-        if len(dims) == 1:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_1d(ctx_weights, {get_ggml_type(init.data_type)}, {dims[0]});"
-            )
-        elif len(dims) == 2:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_2d(ctx_weights, {get_ggml_type(init.data_type)}, {dims[1]}, {dims[0]});"
-            )
-        elif len(dims) == 3:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_3d(ctx_weights, {get_ggml_type(init.data_type)}, {dims[2]}, {dims[1]}, {dims[0]});"
-            )
-        elif len(dims) == 4:
+        # Check if this is a Conv weight that needs dimension reversal
+        elif init_name in conv_weights:
+            op_type, role, original_dims = conv_weights[init_name]
+            # ONNX Conv weight: [out_channels, in_channels, kH, kW]
+            # GGML Conv weight: [kW, kH, in_channels, out_channels] (fully reversed)
+            cpp_lines.append(f"    // {init_name} - {op_type} {role} (ONNX {original_dims} -> GGML reversed)")
             cpp_lines.append(
                 f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(init.data_type)}, {dims[3]}, {dims[2]}, {dims[1]}, {dims[0]});"
             )
-        else:
-            dims_str = ", ".join(map(str, dims))
-            cpp_lines.append(f"    int64_t {var_name}_dims[] = {{{dims_str}}};")
+            init_name = replace_diffusers_names(init_name)
+            cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
+            continue  # Skip the normal dimension handling below
+        # Check if this is a Reshape shape tensor that needs data reversal
+        elif init_name in reshape_shapes:
+            op_type, role, original_dims = reshape_shapes[init_name]
+            # The shape tensor contains dimension values as DATA, not as tensor shape
+            # We need to reverse the VALUES inside the tensor
+            # First create the tensor normally
+            cpp_lines.append(f"    // {init_name} - {op_type} {role} (reversing shape values from ONNX to GGML)")
             cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor(ctx_weights, {get_ggml_type(init.data_type)}, {len(dims)}, {var_name}_dims);"
+                f"    {var_name} = ggml_new_tensor_1d(ctx_weights, {get_ggml_type(init.data_type)}, {dims[0]});"
             )
+            init_name = replace_diffusers_names(init_name)
+            cpp_lines.append(f'    tensor_map["{init_name}"] = {var_name};')
+            # Note: We'll need to reverse the actual data when loading from safetensors
+            # This will be handled in the data loading section
+            continue  # Skip the normal dimension handling below
+        else:
+            cpp_lines.append(f"    // {init_name}")
+
+        # Normalize to 4D for consistent broadcasting in GGML
+        # ONNX broadcasts from the right, so [128,1,1] -> [1,128,1,1]
+        dims_4d = normalize_dims_to_4d(dims)
+
+        # Add comment if dimensions were padded
+        if len(dims) != len(dims_4d):
+            cpp_lines.append(f"    // Original ONNX shape {dims} -> normalized to {dims_4d}")
+
+        # GGML uses REVERSED dimension order: ONNX [N,C,H,W] -> GGML [W,H,C,N]
+        cpp_lines.append(f"    // ONNX {dims_4d} -> GGML reversed")
+        cpp_lines.append(
+            f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(init.data_type)}, {dims_4d[3]}, {dims_4d[2]}, {dims_4d[1]}, {dims_4d[0]});"
+        )
 
         # Add to tensor map
         init_name = replace_diffusers_names(init_name)
@@ -323,28 +449,18 @@ def generate_cpp_code(model, output_path):
         var_name = sanitize_name(const_name)
         cpp_lines.append(f"    // {const_name} - Constant tensor")
 
-        if len(dims) == 1:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_1d(ctx_weights, {get_ggml_type(data_type)}, {dims[0]});"
-            )
-        elif len(dims) == 2:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_2d(ctx_weights, {get_ggml_type(data_type)}, {dims[1]}, {dims[0]});"
-            )
-        elif len(dims) == 3:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_3d(ctx_weights, {get_ggml_type(data_type)}, {dims[2]}, {dims[1]}, {dims[0]});"
-            )
-        elif len(dims) == 4:
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(data_type)}, {dims[3]}, {dims[2]}, {dims[1]}, {dims[0]});"
-            )
-        else:
-            dims_str = ", ".join(map(str, dims))
-            cpp_lines.append(f"    int64_t {var_name}_dims[] = {{{dims_str}}};")
-            cpp_lines.append(
-                f"    {var_name} = ggml_new_tensor(ctx_weights, {get_ggml_type(data_type)}, {len(dims)}, {var_name}_dims);"
-            )
+        # Normalize to 4D for consistent broadcasting in GGML
+        dims_4d = normalize_dims_to_4d(dims)
+
+        # Add comment if dimensions were padded
+        if len(dims) != len(dims_4d):
+            cpp_lines.append(f"    // Original ONNX shape {dims} -> normalized to {dims_4d}")
+
+        # GGML uses REVERSED dimension order: ONNX [N,C,H,W] -> GGML [W,H,C,N]
+        cpp_lines.append(f"    // ONNX {dims_4d} -> GGML reversed")
+        cpp_lines.append(
+            f"    {var_name} = ggml_new_tensor_4d(ctx_weights, {get_ggml_type(data_type)}, {dims_4d[3]}, {dims_4d[2]}, {dims_4d[1]}, {dims_4d[0]});"
+        )
 
         # Add to tensor map
         const_name = replace_diffusers_names(const_name)
@@ -392,7 +508,36 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("        auto it = tensor_map.find(key);")
     cpp_lines.append("        if (it != tensor_map.end()) {")
     cpp_lines.append("            ggml_tensor* tensor = it->second;")
-    cpp_lines.append("            ggml_backend_tensor_set(tensor, tensor_data.data(), 0, ggml_nbytes(tensor));")
+    cpp_lines.append("")
+    # Add special handling for reshape shape tensors
+    if reshape_shapes:
+        reshape_keys = [sanitize_name(k).replace("_", ".") for k in reshape_shapes.keys()]
+        reshape_keys_str = " || ".join([f'key == "{k}"' for k in reshape_shapes.keys()])
+        cpp_lines.append("            // Special handling for Reshape shape tensors - reverse the dimension values")
+        cpp_lines.append(f"            if ({reshape_keys_str}) {{")
+        cpp_lines.append("                // Reverse the shape values from ONNX to GGML order")
+        cpp_lines.append('                if (dtype == "I64") {')
+        cpp_lines.append(
+            "                    const int64_t* onnx_shape = reinterpret_cast<const int64_t*>(tensor_data.data());"
+        )
+        cpp_lines.append("                    size_t num_dims = tensor_data.size() / sizeof(int64_t);")
+        cpp_lines.append("                    std::vector<int64_t> ggml_shape(num_dims);")
+        cpp_lines.append("                    for (size_t i = 0; i < num_dims; ++i) {")
+        cpp_lines.append("                        ggml_shape[i] = onnx_shape[num_dims - 1 - i];")
+        cpp_lines.append("                    }")
+        cpp_lines.append(
+            "                    ggml_backend_tensor_set(tensor, ggml_shape.data(), 0, tensor_data.size());"
+        )
+        cpp_lines.append("                } else {")
+        cpp_lines.append(
+            "                    ggml_backend_tensor_set(tensor, tensor_data.data(), 0, ggml_nbytes(tensor));"
+        )
+        cpp_lines.append("                }")
+        cpp_lines.append("            } else {")
+        cpp_lines.append("                ggml_backend_tensor_set(tensor, tensor_data.data(), 0, ggml_nbytes(tensor));")
+        cpp_lines.append("            }")
+    else:
+        cpp_lines.append("            ggml_backend_tensor_set(tensor, tensor_data.data(), 0, ggml_nbytes(tensor));")
     cpp_lines.append("        } else {")
     cpp_lines.append('            std::cout << "Warning: Unknown tensor key: " << key << std::endl;')
     cpp_lines.append("        }")
@@ -494,7 +639,59 @@ def generate_cpp_code(model, output_path):
                                     vals_str = ", ".join([f"{v}f" for v in values])
                                 elif data_type in [6, 7]:  # INT32, INT64
                                     const_type = "std::vector<int64_t>"
-                                    vals_str = ", ".join([str(int(v)) for v in values])
+                                    # Special handling for Reshape shape constants - reverse the values
+                                    if const_name in constants_used_as_reshape_shapes:
+                                        # Reverse from ONNX to GGML order
+                                        values_reversed = list(reversed(values))
+                                        vals_str = ", ".join([str(int(v)) for v in values_reversed])
+                                    # Special handling for Unsqueeze/Squeeze axes - convert axis positions
+                                    elif const_name in unsqueeze_squeeze_axes:
+                                        op_type, input_name = unsqueeze_squeeze_axes[const_name]
+                                        # Get input tensor rank
+                                        input_rank = len(tensor_shapes.get(input_name, []))
+                                        if input_rank == 0:
+                                            # Unknown rank, assume it's at least 1D
+                                            input_rank = 1
+
+                                        # Calculate output rank
+                                        num_axes = len(values)
+                                        if op_type == "Unsqueeze":
+                                            output_rank = input_rank + num_axes
+                                        else:  # Squeeze
+                                            output_rank = input_rank - num_axes
+
+                                        # Convert each axis: ggml_axis = (output_rank - 1) - onnx_axis
+                                        values_converted = [(output_rank - 1) - int(v) for v in values]
+                                        vals_str = ", ".join([str(v) for v in values_converted])
+                                        # Store conversion info for comment later
+                                        constant_values[const_name] = (
+                                            const_type,
+                                            f"{{{vals_str}}}",
+                                            values,
+                                            f"{op_type} axes (ONNX {[int(v) for v in values]} -> GGML {values_converted}, input_rank={input_rank}, output_rank={output_rank})",
+                                        )
+                                    # Special handling for Slice axes - convert axis positions
+                                    elif const_name in constants_used_as_slice_axes:
+                                        input_name = constants_used_as_slice_axes[const_name]
+                                        # Get input tensor rank
+                                        input_rank = len(tensor_shapes.get(input_name, []))
+                                        if input_rank == 0:
+                                            # Unknown rank, assume it's at least 4D (common for vision models)
+                                            input_rank = 4
+
+                                        # For Slice, output rank equals input rank
+                                        # Convert each axis: ggml_axis = (input_rank - 1) - onnx_axis
+                                        values_converted = [(input_rank - 1) - int(v) for v in values]
+                                        vals_str = ", ".join([str(v) for v in values_converted])
+                                        # Store conversion info for comment later
+                                        constant_values[const_name] = (
+                                            const_type,
+                                            f"{{{vals_str}}}",
+                                            values,
+                                            f"Slice axes (ONNX {[int(v) for v in values]} -> GGML {values_converted}, input_rank={input_rank})",
+                                        )
+                                    else:
+                                        vals_str = ", ".join([str(int(v)) for v in values])
                                 else:
                                     const_type = "std::vector<float>"
                                     vals_str = ", ".join([f"{float(v)}f" for v in values])
@@ -526,9 +723,20 @@ def generate_cpp_code(model, output_path):
 
                 # Otherwise, generate inline constant
                 if const_name in constant_values:
-                    const_type, value_str, _ = constant_values[const_name]
+                    const_val_tuple = constant_values[const_name]
+                    const_type = const_val_tuple[0]
+                    value_str = const_val_tuple[1]
+                    # Check if there's a conversion comment (4th element)
+                    has_comment = len(const_val_tuple) > 3
+
                     var_name = sanitize_name(const_name)
                     graph_lines.append(f"    // Node: {node_name} (Op: {op_type})")
+                    # Add note if this is a Reshape shape constant that was reversed
+                    if const_name in constants_used_as_reshape_shapes:
+                        graph_lines.append(f"    // Reshape shape constant (reversed from ONNX to GGML order)")
+                    # Add note if this is an Unsqueeze/Squeeze axes constant that was converted
+                    elif has_comment:
+                        graph_lines.append(f"    // {const_val_tuple[3]}")
                     graph_lines.append(f"    const {const_type} {var_name} = {value_str};")
                     tensor_vars[const_name] = var_name
                     graph_lines.append("")
@@ -577,8 +785,42 @@ def generate_cpp_code(model, output_path):
                     graph_lines.append(f"    float {attr_var_name} = {attr.f}f;")
                     attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.INTS:
-                    vals = ", ".join(map(str, attr.ints))
-                    graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals}}};")
+                    vals = list(attr.ints)
+                    # Special handling for Reshape 'shape' attribute
+                    # Need to reverse the dimensions from ONNX to GGML order
+                    if op_type == "Reshape" and attr_name == "shape" and len(vals) > 0:
+                        # Reverse the shape dimensions for GGML
+                        vals_reversed = list(reversed(vals))
+                        vals_str = ", ".join(map(str, vals_reversed))
+                        graph_lines.append(f"    // Reshape shape: ONNX {list(vals)} -> GGML {vals_reversed}")
+                        graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals_str}}};")
+                    # Special handling for Pad 'pads' attribute
+                    # ONNX format: [x1_begin, x2_begin, ..., xn_begin, x1_end, x2_end, ..., xn_end]
+                    # The ggml_onnx_pad function handles the conversion internally, so pass as-is
+                    elif op_type == "Pad" and attr_name == "pads" and len(vals) > 0:
+                        vals_str = ", ".join(map(str, vals))
+                        graph_lines.append(
+                            f"    // Pad pads (ONNX format - will be converted inside ggml_onnx_pad): {list(vals)}"
+                        )
+                        graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals_str}}};")
+                    # Special handling for Unsqueeze/Squeeze 'axes' attribute
+                    # Need to convert axis positions from ONNX to GGML order
+                    # ONNX axes refer to output positions in ONNX order [N,C,H,W]
+                    # GGML uses reversed order [W,H,C,N], so axis positions need conversion
+                    elif (op_type in ["Unsqueeze", "Squeeze"]) and attr_name == "axes" and len(vals) > 0:
+                        # Determine the output rank to know how to convert axes
+                        # For Unsqueeze: output_rank = input_rank + len(axes)
+                        # For Squeeze: output_rank = input_rank - len(axes)
+                        # We'll assume 4D output for now (most common case)
+                        output_rank = 4
+                        # Convert each axis: ggml_axis = (output_rank - 1) - onnx_axis
+                        vals_converted = [output_rank - 1 - v for v in vals]
+                        vals_str = ", ".join(map(str, vals_converted))
+                        graph_lines.append(f"    // {op_type} axes: ONNX {list(vals)} -> GGML {vals_converted}")
+                        graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals_str}}};")
+                    else:
+                        vals_str = ", ".join(map(str, vals))
+                        graph_lines.append(f"    std::vector<int64_t> {attr_var_name} = {{{vals_str}}};")
                     attr_vars.append(attr_var_name)
                 elif attr.type == onnx.AttributeProto.FLOATS:
                     vals = ", ".join([f"{v}f" for v in attr.floats])
@@ -639,6 +881,7 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("    ggml_context* ctx = ggml_init(params);")
     cpp_lines.append("")
     cpp_lines.append("    // Create input tensor with graph's expected shape")
+    cpp_lines.append("    // Note: Converting ONNX dimension order (NCHW) to GGML order (WHCN)")
 
     if len(inputs) == 1:
         input_info = list(inputs.values())[0]
@@ -648,7 +891,7 @@ def generate_cpp_code(model, output_path):
         elem_type = input_info.type.tensor_type.elem_type
         ggml_type = get_ggml_type(elem_type)
 
-        cpp_lines.append(f"    // Input '{input_name}' shape: {dims}")
+        cpp_lines.append(f"    // Input '{input_name}' ONNX shape: {dims}")
 
         # Filter out dynamic dimensions (-1) for the actual tensor creation
         static_dims = [d for d in dims if d > 0]
@@ -660,10 +903,12 @@ def generate_cpp_code(model, output_path):
             dim_str = str(dims[0]) if dims[0] > 0 else "1 /* dynamic */"
             cpp_lines.append(f"    ggml_tensor* input = ggml_new_tensor_1d(ctx, {ggml_type}, {dim_str});")
         elif len(dims) == 2:
+            # 2D: ONNX [dim0, dim1] -> GGML [dim1, dim0]
             dim0_str = str(dims[0]) if dims[0] > 0 else "1 /* dynamic */"
             dim1_str = str(dims[1]) if dims[1] > 0 else "1 /* dynamic */"
             cpp_lines.append(f"    ggml_tensor* input = ggml_new_tensor_2d(ctx, {ggml_type}, {dim1_str}, {dim0_str});")
         elif len(dims) == 3:
+            # 3D: ONNX [dim0, dim1, dim2] -> GGML [dim2, dim1, dim0]
             dim0_str = str(dims[0]) if dims[0] > 0 else "1 /* dynamic */"
             dim1_str = str(dims[1]) if dims[1] > 0 else "1 /* dynamic */"
             dim2_str = str(dims[2]) if dims[2] > 0 else "1 /* dynamic */"
@@ -671,6 +916,7 @@ def generate_cpp_code(model, output_path):
                 f"    ggml_tensor* input = ggml_new_tensor_3d(ctx, {ggml_type}, {dim2_str}, {dim1_str}, {dim0_str});"
             )
         elif len(dims) == 4:
+            # 4D: ONNX [N, C, H, W] -> GGML [W, H, C, N]
             dim0_str = str(dims[0]) if dims[0] > 0 else "1 /* dynamic */"
             dim1_str = str(dims[1]) if dims[1] > 0 else "1 /* dynamic */"
             dim2_str = str(dims[2]) if dims[2] > 0 else "1 /* dynamic */"
@@ -695,6 +941,12 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("")
     cpp_lines.append("    // Build computation graph")
     cpp_lines.append("    ggml_cgraph* gf = getGraph(ctx, input);")
+    cpp_lines.append("")
+    cpp_lines.append("    // Print input tensor shape for debugging")
+    cpp_lines.append("    if (input) {")
+    cpp_lines.append('        fprintf(stderr, "Input tensor dims: [%lld, %lld, %lld, %lld]\\n",')
+    cpp_lines.append("                input->ne[0], input->ne[1], input->ne[2], input->ne[3]);")
+    cpp_lines.append("    }")
     cpp_lines.append("")
     cpp_lines.append("    // Allocate tensors")
     cpp_lines.append("    ggml_gallocr_alloc_graph(allocr, gf);")
