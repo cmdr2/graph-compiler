@@ -7,23 +7,70 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-static inline void print(const std::string& msg) { std::cout << msg << std::endl; }
-static inline void print_shape(ggml_tensor* t, std::string tensor_name) {
+static inline void print(const std::string& msg) {
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
+    std::cout << msg << std::endl;
+#endif
+}
+static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name) {
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Shape of " << tensor_name << ": ";
     for (int i = 0; i < 4; ++i) {
         std::cout << t->ne[i] << (i < 3 ? " x " : "");
     }
     std::cout << std::endl;
+#endif
+}
+
+// Helper function to print tensor values for debugging
+static inline void print_tensor_values(const char* name, ggml_tensor* tensor) {
+    if (!tensor) {
+        std::cout << "\n" << name << ":\n";
+        std::cout << "  <NULL tensor>\n";
+        return;
+    }
+
+    int64_t n = ggml_nelements(tensor);
+    if (n == 0) {
+        std::cout << "\n" << name << ":\n";
+        std::cout << "  <Empty tensor>\n";
+        return;
+    }
+
+    std::vector<float> data(n);
+    ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+
+    // Print tensor info
+    std::cout << "\n" << name << ":\n";
+    std::cout << "  Shape: (";
+    int n_dims = ggml_n_dims(tensor);
+    for (int i = n_dims - 1; i >= 0; i--) {
+        std::cout << tensor->ne[i];
+        if (i > 0) std::cout << ", ";
+    }
+    std::cout << "), Type: " << ggml_type_name(tensor->type) << "\n";
+
+    // Print first 10 values
+    int64_t num_to_print = std::min(n, (int64_t)10);
+    std::cout << "  First " << num_to_print << " values: [";
+    std::cout << std::setprecision(8);
+    for (int64_t i = 0; i < num_to_print; i++) {
+        std::cout << data[i];
+        if (i < num_to_print - 1) std::cout << " ";
+    }
+    std::cout << "]\n";
 }
 
 static inline void ggml_onnx_compute_slice_params(int rank, const std::vector<int64_t>& dim_sizes,
@@ -52,10 +99,12 @@ static inline ggml_tensor* ggml_onnx_conv(ggml_context* ctx, ggml_tensor* input,
     int d1 = dilations.size() > 1 ? dilations[1] : 1;  // dilation_w
 
     // print shape of input and weight
-    print_shape(input, "input");
-    print_shape(weight, "weight");
+    print_tensor_shape(input, "input");
+    print_tensor_shape(weight, "weight");
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Conv parameters: stride=(" << s0 << ", " << s1 << "), padding=(" << p0 << ", " << p1
               << "), dilation=(" << d0 << ", " << d1 << ")\n";
+#endif
 
     // Note: group parameter is not used by ggml_conv_2d, but kept for API compatibility
     (void)group;
@@ -65,30 +114,30 @@ static inline ggml_tensor* ggml_onnx_conv(ggml_context* ctx, ggml_tensor* input,
     ggml_tensor* conv_result = ggml_conv_2d(ctx, weight, input, s0, s1, p0, p1, d0, d1);
 
     // print the shapes of conv_result and bias
-    print_shape(conv_result, "conv_result");
-    if (bias != NULL) print_shape(bias, "bias");
+    print_tensor_shape(conv_result, "conv_result");
+    if (bias != NULL) print_tensor_shape(bias, "bias");
     // Add bias if provided
     if (bias != NULL) {
         conv_result = ggml_add(ctx, conv_result, bias);
     }
 
-    print_shape(conv_result, "output");
+    print_tensor_shape(conv_result, "output");
     return conv_result;
 }
 
 // Relu - Rectified Linear Unit
 // Maps to ggml_relu
 static inline ggml_tensor* ggml_onnx_relu(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_relu(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // GlobalAveragePool - Global Average Pooling
 // Averages across spatial dimensions (H, W)
 static inline ggml_tensor* ggml_onnx_globalaveragepool(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // For a 4D tensor [N, C, H, W], compute mean over H and W dimensions
     // ggml_mean reduces the last dimension, so we need to handle this carefully
 
@@ -100,15 +149,17 @@ static inline ggml_tensor* ggml_onnx_globalaveragepool(ggml_context* ctx, ggml_t
                                          input->ne[1],  // stride height
                                          0, 0);         // padding
 
-    print_shape(pooled_h, "output");
+    print_tensor_shape(pooled_h, "output");
     return pooled_h;
 }
 
 // Flatten - Flatten tensor to 2D
 // Maps to ggml_reshape or ggml_view
 static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* input, int64_t axis = 1) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Flatten axis: " << axis << std::endl;
+#endif
 
     // Flatten all dimensions except the batch dimension
     // Input: [N, C, H, W] -> Output: [N, C*H*W]
@@ -119,7 +170,7 @@ static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* inp
 
     ggml_tensor* flattened = ggml_reshape_2d(ctx, input, flattened_size, batch_size);
 
-    print_shape(flattened, "output");
+    print_tensor_shape(flattened, "output");
     return flattened;
 }
 
@@ -128,11 +179,13 @@ static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* inp
 // Maps to ggml_mul_mat and ggml_add
 static inline ggml_tensor* ggml_onnx_gemm(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, ggml_tensor* c,
                                           float alpha = 1.0f, float beta = 1.0f, int64_t transB = 1) {
-    print_shape(a, "a");
-    print_shape(b, "b");
-    if (c != NULL) print_shape(c, "c");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
+    if (c != NULL) print_tensor_shape(c, "c");
 
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Gemm parameters: alpha=" << alpha << ", beta=" << beta << ", transB=" << transB << std::endl;
+#endif
 
     // ONNX Gemm: Y = alpha * A * B^T + beta * C (when transB=1)
     // Currently alpha and beta are not used in scaling, but kept for API compatibility
@@ -142,22 +195,22 @@ static inline ggml_tensor* ggml_onnx_gemm(ggml_context* ctx, ggml_tensor* a, ggm
 
     // ggml_mul_mat computes: a * b^T
     ggml_tensor* result = ggml_mul_mat(ctx, b, a);
-    print_shape(result, "mul_mat_result");
+    print_tensor_shape(result, "mul_mat_result");
 
     // Add bias if provided
     if (c != NULL) {
         result = ggml_add(ctx, result, c);
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // MatMul - Matrix Multiplication
 // Maps to ggml_mul_mat
 static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
 
     // ONNX MatMul: C = A @ B
     // For ONNX A[M,K] @ B[K,N] = C[M,N]:
@@ -174,17 +227,17 @@ static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, g
 
     // Transpose b to match dimensions for ggml_mul_mat
     ggml_tensor* b_t = ggml_cont(ctx, ggml_transpose(ctx, b));
-    print_shape(b_t, "b_transposed");
+    print_tensor_shape(b_t, "b_transposed");
 
     ggml_tensor* result = ggml_mul_mat(ctx, a, b_t);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Add - Element-wise addition
 static inline ggml_tensor* ggml_onnx_add(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
 
     // GGML expects the larger tensor first for broadcasting
     // Determine which tensor is larger by comparing total elements
@@ -203,24 +256,24 @@ static inline ggml_tensor* ggml_onnx_add(ggml_context* ctx, ggml_tensor* a, ggml
         result = ggml_add(ctx, a, b);
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Sub - Element-wise subtraction
 static inline ggml_tensor* ggml_onnx_sub(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
     ggml_tensor* result = ggml_sub(ctx, a, b);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Mul - Element-wise multiplication
 static inline ggml_tensor* ggml_onnx_mul(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
     // print the shapes of a and b
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
 
     // GGML expects the larger tensor first for broadcasting
     // Determine which tensor is larger by comparing total elements
@@ -239,84 +292,84 @@ static inline ggml_tensor* ggml_onnx_mul(ggml_context* ctx, ggml_tensor* a, ggml
         result = ggml_mul(ctx, a, b);
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Div - Element-wise division
 static inline ggml_tensor* ggml_onnx_div(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
     ggml_tensor* result = ggml_div(ctx, a, b);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Sqrt - Element-wise square root
 static inline ggml_tensor* ggml_onnx_sqrt(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_sqrt(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Tanh - Hyperbolic tangent
 static inline ggml_tensor* ggml_onnx_tanh(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_tanh(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Sigmoid - Sigmoid activation
 static inline ggml_tensor* ggml_onnx_sigmoid(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_sigmoid(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Softmax - Softmax activation
 static inline ggml_tensor* ggml_onnx_softmax(ggml_context* ctx, ggml_tensor* input, int64_t axis = -1) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // Note: axis parameter specifies which axis to apply softmax on
     // ggml_soft_max operates on the last dimension, so axis is kept for API compatibility
     (void)axis;  // Unused for now
 
     ggml_tensor* result = ggml_soft_max(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // BatchNormalization - Batch normalization
 static inline ggml_tensor* ggml_onnx_batchnormalization(ggml_context* ctx, ggml_tensor* input, ggml_tensor* scale,
                                                         ggml_tensor* bias, ggml_tensor* mean, ggml_tensor* var) {
-    print_shape(input, "input");
-    print_shape(scale, "scale");
-    print_shape(bias, "bias");
-    print_shape(mean, "mean");
-    print_shape(var, "var");
+    print_tensor_shape(input, "input");
+    print_tensor_shape(scale, "scale");
+    print_tensor_shape(bias, "bias");
+    print_tensor_shape(mean, "mean");
+    print_tensor_shape(var, "var");
 
     // Y = (X - mean) / sqrt(var + epsilon) * scale + bias
     // This is a simplified version - full implementation would need epsilon parameter
 
     ggml_tensor* normalized = ggml_sub(ctx, input, mean);
-    print_shape(normalized, "normalized_sub");
+    print_tensor_shape(normalized, "normalized_sub");
     ggml_tensor* std = ggml_sqrt(ctx, var);
-    print_shape(std, "std");
+    print_tensor_shape(std, "std");
     normalized = ggml_div(ctx, normalized, std);
-    print_shape(normalized, "normalized_div");
+    print_tensor_shape(normalized, "normalized_div");
     normalized = ggml_mul(ctx, normalized, scale);
-    print_shape(normalized, "normalized_mul");
+    print_tensor_shape(normalized, "normalized_mul");
     normalized = ggml_add(ctx, normalized, bias);
-    print_shape(normalized, "output");
+    print_tensor_shape(normalized, "output");
 
     return normalized;
 }
 
 // MaxPool - Max Pooling
 static inline ggml_tensor* ggml_onnx_maxpool(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // Default 2x2 pooling with stride 2
     int kernel_h = 2;
     int kernel_w = 2;
@@ -326,13 +379,13 @@ static inline ggml_tensor* ggml_onnx_maxpool(ggml_context* ctx, ggml_tensor* inp
 
     ggml_tensor* result =
         ggml_pool_2d(ctx, input, GGML_OP_POOL_MAX, kernel_w, kernel_h, stride_w, stride_h, padding, padding);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // AveragePool - Average Pooling
 static inline ggml_tensor* ggml_onnx_averagepool(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // Default 2x2 pooling with stride 2
     int kernel_h = 2;
     int kernel_w = 2;
@@ -342,27 +395,29 @@ static inline ggml_tensor* ggml_onnx_averagepool(ggml_context* ctx, ggml_tensor*
 
     ggml_tensor* result =
         ggml_pool_2d(ctx, input, GGML_OP_POOL_AVG, kernel_w, kernel_h, stride_w, stride_h, padding, padding);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Transpose - Transpose tensor
 static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* input,
                                                const std::vector<int64_t>& perm = {}) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
-    // print perm
+// print perm
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Transpose perm: ";
     for (size_t i = 0; i < perm.size(); i++) {
         std::cout << perm[i] << " ";
     }
     std::cout << std::endl;
+#endif
 
     int ndims = ggml_n_dims(input);
 
     // Handle empty perm - no transpose needed
     if (perm.empty()) {
-        print_shape(input, "output");
+        print_tensor_shape(input, "output");
         return input;
     }
 
@@ -437,7 +492,7 @@ static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* i
     }
 
     if (is_identity) {
-        print_shape(working_input, "output");
+        print_tensor_shape(working_input, "output");
         return working_input;
     }
 
@@ -448,9 +503,11 @@ static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* i
     int axis2 = ggml_perm[2];
     int axis3 = ggml_perm[3];
 
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "Transpose: ONNX perm size=" << perm_size << ", ggml_n_dims=" << ndims
               << ", actual_ndims=" << actual_ndims << ", GGML axes=[" << axis0 << "," << axis1 << "," << axis2 << ","
               << axis3 << "]" << std::endl;
+#endif
 
     ggml_tensor* result = ggml_permute(ctx, working_input, axis0, axis1, axis2, axis3);
 
@@ -458,7 +515,7 @@ static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* i
     // a contiguous tensor. Use ggml_cont to make it contiguous.
     result = ggml_cont(ctx, result);
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
@@ -466,7 +523,7 @@ static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* i
 // Accepts a vector of dimensions for the new shape
 static inline ggml_tensor* ggml_onnx_reshape(ggml_context* ctx, ggml_tensor* input, const std::vector<int64_t>& shape,
                                              int64_t allowzero = 0) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // Note: allowzero parameter is not used by ggml reshape functions, but kept for API compatibility
     (void)allowzero;
 
@@ -488,18 +545,18 @@ static inline ggml_tensor* ggml_onnx_reshape(ggml_context* ctx, ggml_tensor* inp
         result = input;
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Concat - Concatenate tensors
 // Base case: 2 tensors
 static inline ggml_tensor* ggml_onnx_concat(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
-    print_shape(a, "a");
-    print_shape(b, "b");
+    print_tensor_shape(a, "a");
+    print_tensor_shape(b, "b");
     // Concatenate along dimension 0
     ggml_tensor* result = ggml_concat(ctx, a, b, 0);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
@@ -516,7 +573,9 @@ static inline ggml_tensor* ggml_onnx_concat(ggml_context* ctx, ggml_tensor* a, g
 static inline ggml_tensor* ggml_onnx_slice(ggml_context* ctx, ggml_tensor* input, const std::vector<int64_t>& starts,
                                            const std::vector<int64_t>& ends, const std::vector<int64_t>& axes = {},
                                            const std::vector<int64_t>& steps = {}) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
+
+#ifdef _COMPILER_PRINT_TENSOR_VALUES
     std::cout << "starts: ";
     for (auto s : starts) std::cout << std::to_string(s) + " ";
     std::cout << "\nends: ";
@@ -526,6 +585,7 @@ static inline ggml_tensor* ggml_onnx_slice(ggml_context* ctx, ggml_tensor* input
     std::cout << "\nsteps: ";
     for (auto st : steps) std::cout << std::to_string(st) + " ";
     std::cout << "\n";
+#endif
 
     int r = ggml_n_dims(input);  // rank of input
 
@@ -573,180 +633,180 @@ static inline ggml_tensor* ggml_onnx_slice(ggml_context* ctx, ggml_tensor* input
         result = ggml_view_tensor(ctx, input);
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Clip - Clip tensor values to [min, max]
 static inline ggml_tensor* ggml_onnx_clip(ggml_context* ctx, ggml_tensor* input, float min_val, float max_val) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_clamp(ctx, input, min_val, max_val);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // LeakyRelu - Leaky ReLU activation
 static inline ggml_tensor* ggml_onnx_leakyrelu(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_leaky_relu(ctx, input, 0.01f, true);  // Default alpha=0.01
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Gelu - GELU activation
 static inline ggml_tensor* ggml_onnx_gelu(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_gelu(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // LayerNormalization - Layer normalization
 static inline ggml_tensor* ggml_onnx_layernormalization(ggml_context* ctx, ggml_tensor* input, ggml_tensor* scale,
                                                         ggml_tensor* bias) {
-    print_shape(input, "input");
-    if (scale != NULL) print_shape(scale, "scale");
-    if (bias != NULL) print_shape(bias, "bias");
+    print_tensor_shape(input, "input");
+    if (scale != NULL) print_tensor_shape(scale, "scale");
+    if (bias != NULL) print_tensor_shape(bias, "bias");
 
     // Normalize the input and apply scale and bias
     ggml_tensor* normalized = ggml_norm(ctx, input, 1e-5f);
-    print_shape(normalized, "normalized");
+    print_tensor_shape(normalized, "normalized");
     if (scale != NULL) {
         normalized = ggml_mul(ctx, normalized, scale);
-        print_shape(normalized, "after_scale");
+        print_tensor_shape(normalized, "after_scale");
     }
     if (bias != NULL) {
         normalized = ggml_add(ctx, normalized, bias);
     }
-    print_shape(normalized, "output");
+    print_tensor_shape(normalized, "output");
     return normalized;
 }
 
 // ReduceMean - Reduce mean across dimensions
 static inline ggml_tensor* ggml_onnx_reducemean(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_mean(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // ReduceSum - Reduce sum across dimensions
 static inline ggml_tensor* ggml_onnx_reducesum(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_sum(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Pow - Element-wise power
 // Version with scalar exponent
 static inline ggml_tensor* ggml_onnx_pow(ggml_context* ctx, ggml_tensor* base, float exp_val) {
-    print_shape(base, "base");
+    print_tensor_shape(base, "base");
 
     // Handle special cases
     if (exp_val == 2.0f) {
         ggml_tensor* result = ggml_sqr(ctx, base);
-        print_shape(result, "output");
+        print_tensor_shape(result, "output");
         return result;
     } else if (exp_val == 0.5f) {
         ggml_tensor* result = ggml_sqrt(ctx, base);
-        print_shape(result, "output");
+        print_tensor_shape(result, "output");
         return result;
     } else if (exp_val == 1.0f) {
-        print_shape(base, "output");
+        print_tensor_shape(base, "output");
         return base;  // x^1 = x
     }
 
     // For general case: pow(base, exp) = exp(exp * log(base))
     ggml_tensor* log_base = ggml_log(ctx, base);
-    print_shape(log_base, "log_base");
+    print_tensor_shape(log_base, "log_base");
     ggml_tensor* scaled = ggml_scale(ctx, log_base, exp_val);
-    print_shape(scaled, "scaled");
+    print_tensor_shape(scaled, "scaled");
     ggml_tensor* result = ggml_exp(ctx, scaled);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Version with tensor exponent (for when exponent is not a constant)
 static inline ggml_tensor* ggml_onnx_pow(ggml_context* ctx, ggml_tensor* base, ggml_tensor* exponent) {
-    print_shape(base, "base");
-    print_shape(exponent, "exponent");
+    print_tensor_shape(base, "base");
+    print_tensor_shape(exponent, "exponent");
 
     // For tensor exponents, use: e^(exponent * ln(base))
     // pow(base, exp) = exp(exp * log(base))
     ggml_tensor* log_base = ggml_log(ctx, base);
-    print_shape(log_base, "log_base");
+    print_tensor_shape(log_base, "log_base");
     ggml_tensor* product = ggml_mul(ctx, exponent, log_base);
-    print_shape(product, "product");
+    print_tensor_shape(product, "product");
     ggml_tensor* result = ggml_exp(ctx, product);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Exp - Element-wise exponential
 static inline ggml_tensor* ggml_onnx_exp(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_exp(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Log - Element-wise natural logarithm
 static inline ggml_tensor* ggml_onnx_log(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_log(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Abs - Element-wise absolute value
 static inline ggml_tensor* ggml_onnx_abs(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_abs(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Neg - Element-wise negation
 static inline ggml_tensor* ggml_onnx_neg(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     ggml_tensor* result = ggml_neg(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Identity - Return input unchanged
 static inline ggml_tensor* ggml_onnx_identity(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
     // Identity operation just returns the input
     (void)ctx;  // Unused
-    print_shape(input, "output");
+    print_tensor_shape(input, "output");
     return input;
 }
 
 // Erf - Error function
 static inline ggml_tensor* ggml_onnx_erf(ggml_context* ctx, ggml_tensor* input) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     // erf(x) ≈ tanh(sqrt(2/pi) * (x + 0.044715 * x^3))
     // Simplified approximation using available ggml operations
     ggml_tensor* x3 = ggml_mul(ctx, ggml_sqr(ctx, input), input);
-    print_shape(x3, "x3");
+    print_tensor_shape(x3, "x3");
     ggml_tensor* scaled = ggml_scale(ctx, x3, 0.044715f);
-    print_shape(scaled, "scaled");
+    print_tensor_shape(scaled, "scaled");
     ggml_tensor* sum = ggml_add(ctx, input, scaled);
-    print_shape(sum, "sum");
+    print_tensor_shape(sum, "sum");
     ggml_tensor* scaled_sum = ggml_scale(ctx, sum, sqrtf(2.0f / M_PI));
-    print_shape(scaled_sum, "scaled_sum");
+    print_tensor_shape(scaled_sum, "scaled_sum");
     ggml_tensor* result = ggml_tanh(ctx, scaled_sum);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Cast - Cast tensor to different type
 static inline ggml_tensor* ggml_onnx_cast(ggml_context* ctx, ggml_tensor* input, int64_t to = 1) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     // Use ggml_cast to convert type
     // The 'to' parameter is an ONNX data type enum
@@ -767,21 +827,21 @@ static inline ggml_tensor* ggml_onnx_cast(ggml_context* ctx, ggml_tensor* input,
     }
 
     ggml_tensor* result = ggml_cast(ctx, input, target_type);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // InstanceNormalization - Instance normalization
 static inline ggml_tensor* ggml_onnx_instancenormalization(ggml_context* ctx, ggml_tensor* input, ggml_tensor* scale,
                                                            ggml_tensor* bias, float epsilon = 1e-5f) {
-    print_shape(input, "input");
-    if (scale != NULL) print_shape(scale, "scale");
-    if (bias != NULL) print_shape(bias, "bias");
+    print_tensor_shape(input, "input");
+    if (scale != NULL) print_tensor_shape(scale, "scale");
+    if (bias != NULL) print_tensor_shape(bias, "bias");
 
     // Instance normalization: normalize each instance (per channel) independently
     // Y = scale * (X - mean) / sqrt(variance + epsilon) + bias
     ggml_tensor* normalized = ggml_norm(ctx, input, epsilon);
-    print_shape(normalized, "output");
+    print_tensor_shape(normalized, "output");
     // if (scale != NULL) {
     //     normalized = ggml_mul(ctx, normalized, scale);
     // }
@@ -793,7 +853,7 @@ static inline ggml_tensor* ggml_onnx_instancenormalization(ggml_context* ctx, gg
 
 // RandomNormalLike - Create a tensor with random normal distribution, with same shape as input
 static inline ggml_tensor* ggml_onnx_randomnormallike(ggml_context* ctx, ggml_tensor* input, int64_t dtype = 1) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     // Note: dtype parameter specifies the data type (1=FLOAT, etc.)
     // ggml doesn't have built-in random initialization with specific types
@@ -802,7 +862,7 @@ static inline ggml_tensor* ggml_onnx_randomnormallike(ggml_context* ctx, ggml_te
     // Create a tensor with the same shape as input, filled with random normal values
     // In practice, this would need to be filled with random values after creation
     ggml_tensor* result = ggml_dup_tensor(ctx, input);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
@@ -810,10 +870,10 @@ static inline ggml_tensor* ggml_onnx_randomnormallike(ggml_context* ctx, ggml_te
 // Accepts a vector of axes where dimensions of size 1 should be inserted
 static inline ggml_tensor* ggml_onnx_unsqueeze(ggml_context* ctx, ggml_tensor* input,
                                                const std::vector<int64_t>& axes) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     if (axes.empty()) {
-        print_shape(input, "output");
+        print_tensor_shape(input, "output");
         return input;
     }
 
@@ -862,7 +922,7 @@ static inline ggml_tensor* ggml_onnx_unsqueeze(ggml_context* ctx, ggml_tensor* i
         result = input;
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
@@ -871,7 +931,7 @@ static inline ggml_tensor* ggml_onnx_unsqueeze(ggml_context* ctx, ggml_tensor* i
 // If axes is empty, removes all dimensions of size 1
 static inline ggml_tensor* ggml_onnx_squeeze(ggml_context* ctx, ggml_tensor* input,
                                              const std::vector<int64_t>& axes = {}) {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     int ndims = ggml_n_dims(input);
     std::vector<int64_t> new_shape;
@@ -928,7 +988,7 @@ static inline ggml_tensor* ggml_onnx_squeeze(ggml_context* ctx, ggml_tensor* inp
         result = input;
     }
 
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
@@ -938,7 +998,7 @@ static inline ggml_tensor* ggml_onnx_squeeze(ggml_context* ctx, ggml_tensor* inp
 // ONNX dimensions are [N, C, H, W], GGML dimensions are [W, H, C, N] (reversed)
 static inline ggml_tensor* ggml_onnx_pad(ggml_context* ctx, ggml_tensor* input, const std::vector<int64_t>& pads,
                                          float constant_value = 0.0f, const std::string& mode = "constant") {
-    print_shape(input, "input");
+    print_tensor_shape(input, "input");
 
     // Note: constant_value and mode would need custom implementation
     (void)constant_value;  // Unused for now (ggml_pad uses 0)
@@ -947,7 +1007,7 @@ static inline ggml_tensor* ggml_onnx_pad(ggml_context* ctx, ggml_tensor* input, 
     int ndims = ggml_n_dims(input);
 
     if (pads.empty()) {
-        print_shape(input, "output");
+        print_tensor_shape(input, "output");
         return input;
     }
 
@@ -982,19 +1042,19 @@ static inline ggml_tensor* ggml_onnx_pad(ggml_context* ctx, ggml_tensor* input, 
     int rp3 = onnx_end[0];
 
     ggml_tensor* result = ggml_pad_ext(ctx, input, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 
 // Gather - Gather elements
 static inline ggml_tensor* ggml_onnx_gather(ggml_context* ctx, ggml_tensor* data, ggml_tensor* indices) {
-    print_shape(data, "data");
-    print_shape(indices, "indices");
+    print_tensor_shape(data, "data");
+    print_tensor_shape(indices, "indices");
 
     // Gather elements from data using indices
     // ggml_get_rows is similar to gather operation along axis 0
     ggml_tensor* result = ggml_get_rows(ctx, data, indices);
-    print_shape(result, "output");
+    print_tensor_shape(result, "output");
     return result;
 }
 

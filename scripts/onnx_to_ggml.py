@@ -57,12 +57,17 @@ def normalize_dims_to_4d(dims):
     return [1] * (4 - len(dims)) + dims
 
 
-def generate_cpp_code(model, output_path):
+def generate_cpp_code(model, output_path, print_values=False):
     """Generate C++ code from ONNX model.
 
     Creates two files:
     - <name>_graph.h: Contains the getGraph() function
     - <name>.cpp: Contains all boilerplate code and includes the graph header
+
+    Args:
+        model: ONNX model to convert
+        output_path: Path for the output C++ file
+        print_values: If True, generates code to print intermediate tensor values
     """
     graph = model.graph
 
@@ -293,6 +298,10 @@ def generate_cpp_code(model, output_path):
 
     # Start building the main C++ code
     cpp_lines = []
+    if print_values:
+        cpp_lines.append("#define _COMPILER_PRINT_TENSOR_VALUES")
+        cpp_lines.append("")
+
     cpp_lines.append('#include "ggml.h"')
     cpp_lines.append('#include "ggml-onnx.h"')
     cpp_lines.append('#include "ggml-cpu.h"')
@@ -836,8 +845,19 @@ def generate_cpp_code(model, output_path):
             else:
                 attrs_str = ""
 
-            graph_lines.append(f'    std::cout << "Inserting {op_type} node: {node_name}\\n";')
+            if print_values:
+                graph_lines.append(f'    std::cout << "Inserting {op_type} node: {node_name}\\n";')
             graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str}{attrs_str});")
+
+            # Set tensor name for debugging/printing if print_values is enabled
+            if print_values and len(node.output) > 0:
+                original_output_name = node.output[0]
+                # Use snprintf to safely copy the name, respecting GGML_MAX_NAME
+                graph_lines.append(f"    if ({output_vars[0]}) {{")
+                graph_lines.append(
+                    f'        snprintf({output_vars[0]}->name, sizeof({output_vars[0]}->name), "{original_output_name}");'
+                )
+                graph_lines.append(f"    }}")
         else:
             graph_lines.append(f"    // Multiple outputs from {op_type}")
             for out_var in output_vars:
@@ -957,6 +977,28 @@ def generate_cpp_code(model, output_path):
     cpp_lines.append("    // Compute the graph")
     cpp_lines.append("    ggml_backend_graph_compute(backend, gf);")
     cpp_lines.append("")
+
+    # Add code to print intermediate values if enabled
+    if print_values:
+        cpp_lines.append("    // Print intermediate tensor values")
+        cpp_lines.append('    std::cout << "\\nIntermediate Tensor Values:\\n";')
+        cpp_lines.append(
+            '    std::cout << "================================================================================" << std::endl;'
+        )
+        cpp_lines.append("    ")
+        cpp_lines.append("    // Print all nodes in the graph")
+        cpp_lines.append("    int n_nodes = ggml_graph_n_nodes(gf);")
+        cpp_lines.append("    for (int i = 0; i < n_nodes; i++) {")
+        cpp_lines.append("        ggml_tensor* node = ggml_graph_node(gf, i);")
+        cpp_lines.append("        if (node && node->name[0] != '\\0') {")
+        cpp_lines.append("            print_tensor_values(node->name, node);")
+        cpp_lines.append("        }")
+        cpp_lines.append("    }")
+        cpp_lines.append("    ")
+        cpp_lines.append(
+            '    std::cout << "================================================================================" << std::endl;'
+        )
+        cpp_lines.append("")
     cpp_lines.append("    // Get output tensor")
     cpp_lines.append("    ggml_tensor* result_node = ggml_graph_node(gf, -1);  // get the last node in the graph")
     cpp_lines.append("")
@@ -1059,6 +1101,9 @@ def main():
     parser.add_argument(
         "-o", "--output", type=str, default=None, help="Output C++ file (default: <input_name>_ggml.cpp)"
     )
+    parser.add_argument(
+        "--print-values", action="store_true", help="Generate code to print intermediate tensor values during execution"
+    )
 
     args = parser.parse_args()
 
@@ -1080,7 +1125,7 @@ def main():
 
     # Generate C++ code
     try:
-        generate_cpp_code(model, output_path)
+        generate_cpp_code(model, output_path, print_values=args.print_values)
         output_path_obj = Path(output_path)
         graph_header_name = f"{output_path_obj.stem}_graph.h"
         print(f"\nSuccess! Generated files:")
