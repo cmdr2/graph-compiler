@@ -54,6 +54,8 @@ static inline ggml_tensor* ggml_onnx_conv(ggml_context* ctx, ggml_tensor* input,
     // print shape of input and weight
     print_shape(input, "input");
     print_shape(weight, "weight");
+    std::cout << "Conv parameters: stride=(" << s0 << ", " << s1 << "), padding=(" << p0 << ", " << p1
+              << "), dilation=(" << d0 << ", " << d1 << ")\n";
 
     // Note: group parameter is not used by ggml_conv_2d, but kept for API compatibility
     (void)group;
@@ -104,11 +106,15 @@ static inline ggml_tensor* ggml_onnx_globalaveragepool(ggml_context* ctx, ggml_t
 
 // Flatten - Flatten tensor to 2D
 // Maps to ggml_reshape or ggml_view
-static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* input) {
+static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* input, int64_t axis = 1) {
     print_shape(input, "input");
+    std::cout << "Flatten axis: " << axis << std::endl;
+
     // Flatten all dimensions except the batch dimension
     // Input: [N, C, H, W] -> Output: [N, C*H*W]
-    int64_t batch_size = input->ne[3];                                    // N (in ggml layout: [W, H, C, N])
+    // The axis parameter determines where to split (default is 1, after batch dimension)
+    (void)axis;                         // Currently not used, but kept for API compatibility
+    int64_t batch_size = input->ne[3];  // N (in ggml layout: [W, H, C, N])
     int64_t flattened_size = input->ne[0] * input->ne[1] * input->ne[2];  // W*H*C
 
     ggml_tensor* flattened = ggml_reshape_2d(ctx, input, flattened_size, batch_size);
@@ -120,12 +126,20 @@ static inline ggml_tensor* ggml_onnx_flatten(ggml_context* ctx, ggml_tensor* inp
 // Gemm - General Matrix Multiplication
 // Y = alpha * A * B + beta * C
 // Maps to ggml_mul_mat and ggml_add
-static inline ggml_tensor* ggml_onnx_gemm(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, ggml_tensor* c) {
+static inline ggml_tensor* ggml_onnx_gemm(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, ggml_tensor* c,
+                                          float alpha = 1.0f, float beta = 1.0f, int64_t transB = 1) {
     print_shape(a, "a");
     print_shape(b, "b");
     if (c != NULL) print_shape(c, "c");
 
-    // Default ONNX Gemm: Y = A * B^T + C (transB=1 is common)
+    std::cout << "Gemm parameters: alpha=" << alpha << ", beta=" << beta << ", transB=" << transB << std::endl;
+
+    // ONNX Gemm: Y = alpha * A * B^T + beta * C (when transB=1)
+    // Currently alpha and beta are not used in scaling, but kept for API compatibility
+    (void)alpha;
+    (void)beta;
+    (void)transB;
+
     // ggml_mul_mat computes: a * b^T
     ggml_tensor* result = ggml_mul_mat(ctx, b, a);
     print_shape(result, "mul_mat_result");
