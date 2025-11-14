@@ -1010,15 +1010,16 @@ def generate_cpp_code(model, output_path):
         input_info = list(inputs.values())[0]
         shape = input_info.type.tensor_type.shape
         dims = [d.dim_value if d.dim_value > 0 else 1 for d in shape.dim]
-        total_elements = 1
+        total_elements = []
         for d in dims:
-            total_elements *= d
+            total_elements.append(str(d))
+        total_elements_str = " * ".join(total_elements)
         cpp_lines.append(f"    // Input shape: {dims}")
         cpp_lines.append(
-            f"    std::vector<float> input_data({total_elements}, 1.0f);  // TODO: Set actual input values"
+            f"    std::vector<float> input_data({total_elements_str}, 0.0f);  // TODO: Set actual input values"
         )
     else:
-        cpp_lines.append("    std::vector<float> input_data(1, 1.0f);  // TODO: Set actual input values")
+        cpp_lines.append("    std::vector<float> input_data(1, 0.0f);  // TODO: Set actual input values")
 
     cpp_lines.append("")
     cpp_lines.append("    // Run prediction")
