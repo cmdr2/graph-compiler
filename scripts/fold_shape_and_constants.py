@@ -417,6 +417,57 @@ def fold_model(input_path, output_path, input_name, input_shape):
 
     print(f"Fixed {reshape_nodes_fixed} Reshape nodes with explicit shapes")
 
+    # Remove redundant InstanceNormalization nodes (scale=all ones, bias=all zeros)
+    print("\nRemoving redundant InstanceNormalization nodes...")
+    removed_instance_norms = 0
+    new_nodes = []
+    output_redirects = {}  # Maps old output -> new output (for bypassed nodes)
+
+    for node in model.graph.node:
+        if node.op_type == "InstanceNormalization":
+            # InstanceNormalization has inputs: X, scale, B (bias)
+            if len(node.input) >= 3:
+                scale_name = node.input[1]
+                bias_name = node.input[2]
+
+                # Check if scale and bias are constants
+                if scale_name in consts and bias_name in consts:
+                    scale_arr = consts[scale_name]
+                    bias_arr = consts[bias_name]
+
+                    # Check if scale is all ones and bias is all zeros
+                    is_scale_ones = np.allclose(scale_arr, 1.0)
+                    is_bias_zeros = np.allclose(bias_arr, 0.0)
+
+                    if is_scale_ones and is_bias_zeros:
+                        # Bypass this node: redirect output to input
+                        input_name = node.input[0]
+                        output_name = node.output[0]
+                        output_redirects[output_name] = input_name
+                        removed_instance_norms += 1
+                        print(
+                            f"Info: Removing redundant InstanceNormalization '{node.name or output_name}' (scale=ones, bias=zeros)"
+                        )
+                        continue  # Skip adding this node
+
+        new_nodes.append(node)
+
+    # Apply output redirects to all nodes
+    for node in new_nodes:
+        for i, inp in enumerate(node.input):
+            if inp in output_redirects:
+                node.input[i] = output_redirects[inp]
+
+    # Apply redirects to graph outputs
+    for out in model.graph.output:
+        if out.name in output_redirects:
+            out.name = output_redirects[out.name]
+
+    model.graph.ClearField("node")
+    model.graph.node.extend(new_nodes)
+
+    print(f"Removed {removed_instance_norms} redundant InstanceNormalization nodes")
+
     # Remove dead nodes (constants that are no longer used)
     # Build set of all used values
     used_values = set()
@@ -458,6 +509,7 @@ def fold_model(input_path, output_path, input_name, input_shape):
     onnx.save(final, output_path)
     print(f"\nSaved folded model to {output_path}")
     print(f"Total nodes folded: {total_nodes_folded} (including {total_shape_nodes_folded} Shape nodes)")
+    print(f"Removed {removed_instance_norms} redundant InstanceNormalization nodes.")
     print(f"Removed {dead_nodes} dead nodes.")
     print(f"Total passes: {passes}")
     return final
