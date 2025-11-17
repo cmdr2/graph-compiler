@@ -846,7 +846,7 @@ def generate_cpp_code(model, output_path, print_values=False):
                 attrs_str = ""
 
             if print_values:
-                graph_lines.append(f'    std::cout << "Inserting {op_type} node: {node_name}\\n";')
+                graph_lines.append(f'    std::cout << "\\nInserting {op_type} node: {node_name}\\n";')
             graph_lines.append(f"    auto {output_vars[0]} = {func_name}(ctx{inputs_str}{attrs_str});")
 
             # Set tensor name for debugging/printing if print_values is enabled
@@ -963,11 +963,9 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("    ggml_cgraph* gf = getGraph(ctx, input);")
     cpp_lines.append("")
     cpp_lines.append("    // Print input tensor shape for debugging")
-    cpp_lines.append("    if (input) {")
     cpp_lines.append(
-        '        std::cout << "Input tensor dims: [" << input->ne[0] << ", " << input->ne[1] << ", " << input->ne[2] << ", " << input->ne[3] << "]" << std::endl;'
+        '    std::cout << "Input tensor dims: [" << input->ne[0] << ", " << input->ne[1] << ", " << input->ne[2] << ", " << input->ne[3] << "]" << std::endl;'
     )
-    cpp_lines.append("    }")
     cpp_lines.append("")
     cpp_lines.append("    // Allocate tensors")
     cpp_lines.append("    ggml_gallocr_alloc_graph(allocr, gf);")
@@ -981,48 +979,39 @@ def generate_cpp_code(model, output_path, print_values=False):
 
     # Add code to print intermediate values if enabled
     if print_values:
+        cpp_lines.append("    // Print input tensor values")
+        cpp_lines.append('    std::cout << "\\nInput Tensor Values:\\n";')
+        cpp_lines.append(
+            '    std::cout << "================================================================================" << std::endl;'
+        )
+        cpp_lines.append('    print_tensor_values("input", input);')
+        cpp_lines.append("    std::cout << std::endl;")
+        cpp_lines.append("")
         cpp_lines.append("    // Print intermediate tensor values")
         cpp_lines.append('    std::cout << "\\nIntermediate Tensor Values:\\n";')
         cpp_lines.append(
             '    std::cout << "================================================================================" << std::endl;'
         )
-        cpp_lines.append("    ")
+        cpp_lines.append("")
         cpp_lines.append("    // Print all nodes in the graph")
         cpp_lines.append("    int n_nodes = ggml_graph_n_nodes(gf);")
         cpp_lines.append("    for (int i = 0; i < n_nodes; i++) {")
         cpp_lines.append("        ggml_tensor* node = ggml_graph_node(gf, i);")
         cpp_lines.append("        if (node && node->name[0] != '\\0') {")
         cpp_lines.append("            print_tensor_values(node->name, node);")
+        cpp_lines.append("            std::cout << std::endl;")
         cpp_lines.append("        }")
         cpp_lines.append("    }")
-        cpp_lines.append("    ")
-        cpp_lines.append(
-            '    std::cout << "================================================================================" << std::endl;'
-        )
         cpp_lines.append("")
     cpp_lines.append("    // Get output tensor")
     cpp_lines.append("    ggml_tensor* result_node = ggml_graph_node(gf, -1);  // get the last node in the graph")
     cpp_lines.append("")
-    cpp_lines.append("    // Read result data")
-    cpp_lines.append("    int64_t n = ggml_nelements(result_node);")
-    cpp_lines.append("    std::vector<float> result_data(n);")
-    cpp_lines.append("    ggml_backend_tensor_get(result_node, result_data.data(), 0, ggml_nbytes(result_node));")
-    # cpp_lines.append("")
-    # cpp_lines.append("    // Print output shape")
-    # cpp_lines.append('    std::cout << "Output shape: ";')
-    # cpp_lines.append("    for (int i = 0; i < result_node->n_dims; i++) {")
-    # cpp_lines.append('        std::cout << result_node->ne[i] << " ";')
-    # cpp_lines.append("    }")
-    # cpp_lines.append("    std::cout << std::endl;")
-    cpp_lines.append("")
-    cpp_lines.append("    // Print output data (first 10 elements)")
-    cpp_lines.append('    std::cout << "Output data: ";')
-    cpp_lines.append("    for (int64_t i = 0; i < std::min(n, (int64_t)10); i++) {")
-    cpp_lines.append('        std::cout << result_data[i] << ", ";')
-    cpp_lines.append("    }")
-    cpp_lines.append("    if (n > 10) {")
-    cpp_lines.append('        std::cout << "...";')
-    cpp_lines.append("    }")
+    cpp_lines.append("    // Print output data")
+    cpp_lines.append('    std::cout << "\\nOutput Tensor Values:\\n";')
+    cpp_lines.append(
+        '    std::cout << "================================================================================" << std::endl;'
+    )
+    cpp_lines.append('    print_tensor_values("output", result_node);')
     cpp_lines.append("    std::cout << std::endl;")
     cpp_lines.append("")
     cpp_lines.append("    // Free context")

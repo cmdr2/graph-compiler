@@ -39,31 +39,48 @@ static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name = 
 }
 
 // Helper function to print tensor values for debugging
-static inline void print_tensor_values(const char* name, ggml_tensor* tensor) {
+static inline void print_tensor_values(const char* name, ggml_tensor* tensor, int indent = 0,
+                                       bool print_inputs = true) {
+    std::string indentation = "";
+    for (int i = 0; i < indent; ++i) {
+        indentation += " ";
+    }
+
+    std::cout << indentation << name << " (" << ggml_op_name(tensor->op) << "):\n";
+
     if (!tensor) {
-        std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
-        std::cout << "  <NULL tensor>\n";
+        std::cout << indentation << "  <NULL tensor>\n";
         return;
     }
 
     int64_t n = ggml_nelements(tensor);
     if (n == 0) {
-        std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
-        std::cout << "  <Empty tensor>\n";
+        std::cout << indentation << "  <Empty tensor>\n";
         return;
     }
 
     std::vector<float> data(n);
     ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
 
-    // Print tensor info
-    std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
-    std::cout << "  ";
-    print_tensor_shape(tensor, name);
+    // Print input
+    if (print_inputs) {
+        if (tensor->src[0] != NULL) {
+            std::cout << indentation << "  Input:\n";
+            print_tensor_values("a", tensor->src[0], indent + 4, false);
+        }
+        if (tensor->src[1] != NULL) {
+            print_tensor_values("b", tensor->src[1], indent + 4, false);
+        }
+    }
 
-    // Print first 10 values
+    // Print output
+    std::cout << indentation << "  ";
+    print_tensor_shape(tensor);
+
+    // Print values
     int64_t num_to_print = std::min(n, (int64_t)10);
-    std::cout << "  First " << num_to_print << " values: [";
+    std::cout << indentation << "  ";
+    std::cout << "Data (first " << num_to_print << "): [";
     std::cout << std::setprecision(8);
     for (int64_t i = 0; i < num_to_print; i++) {
         std::cout << data[i];
