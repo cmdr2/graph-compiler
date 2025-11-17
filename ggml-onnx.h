@@ -24,13 +24,17 @@ static inline void print(const std::string& msg) {
     std::cout << msg << std::endl;
 #endif
 }
-static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name) {
+static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name = "") {
 #ifdef _COMPILER_PRINT_TENSOR_VALUES
-    std::cout << "Shape of " << tensor_name << ": ";
-    for (int i = 0; i < 4; ++i) {
-        std::cout << t->ne[i] << (i < 3 ? " x " : "");
+    if (!tensor_name.empty()) {
+        std::cout << "Shape of " << tensor_name << ": (";
+    } else {
+        std::cout << "Shape: (";
     }
-    std::cout << std::endl;
+    for (int i = 0; i < 4; ++i) {
+        std::cout << t->ne[i] << (i < 3 ? ", " : "");
+    }
+    std::cout << "), Type: " << ggml_type_name(t->type) << std::endl;
 #endif
 }
 
@@ -54,13 +58,8 @@ static inline void print_tensor_values(const char* name, ggml_tensor* tensor) {
 
     // Print tensor info
     std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
-    std::cout << "  Shape: (";
-    int n_dims = ggml_n_dims(tensor);
-    for (int i = n_dims - 1; i >= 0; i--) {
-        std::cout << tensor->ne[i];
-        if (i > 0) std::cout << ", ";
-    }
-    std::cout << "), Type: " << ggml_type_name(tensor->type) << "\n";
+    std::cout << "  ";
+    print_tensor_shape(tensor, name);
 
     // Print first 10 values
     int64_t num_to_print = std::min(n, (int64_t)10);
