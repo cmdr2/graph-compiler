@@ -37,14 +37,14 @@ static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name) {
 // Helper function to print tensor values for debugging
 static inline void print_tensor_values(const char* name, ggml_tensor* tensor) {
     if (!tensor) {
-        std::cout << "\n" << name << ":\n";
+        std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
         std::cout << "  <NULL tensor>\n";
         return;
     }
 
     int64_t n = ggml_nelements(tensor);
     if (n == 0) {
-        std::cout << "\n" << name << ":\n";
+        std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
         std::cout << "  <Empty tensor>\n";
         return;
     }
@@ -53,7 +53,7 @@ static inline void print_tensor_values(const char* name, ggml_tensor* tensor) {
     ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
 
     // Print tensor info
-    std::cout << "\n" << name << ":\n";
+    std::cout << "\n" << name << " (" << ggml_op_name(tensor->op) << "):\n";
     std::cout << "  Shape: (";
     int n_dims = ggml_n_dims(tensor);
     for (int i = n_dims - 1; i >= 0; i--) {
