@@ -137,16 +137,71 @@ def run_onnx_model(onnx_file, input_shape, print_values=False):
         all_outputs = session_with_intermediates.run(None, {input_name: input_data})
         all_output_names = [out.name for out in session_with_intermediates.get_outputs()]
 
+        # Build a mapping from output tensor names to nodes and their inputs
+        tensor_to_node = {}
+        for node in model.graph.node:
+            for output in node.output:
+                tensor_to_node[output] = node
+
+        # Build a mapping from tensor names to their output values
+        tensor_value_map = {}
+        for name, output in zip(all_output_names, all_outputs):
+            tensor_value_map[name] = output
+
+        # Build a mapping of initializers (constants)
+        initializer_map = {}
+        for init in model.graph.initializer:
+            initializer_map[init.name] = init
+
         # Print intermediate values
         print("\nIntermediate Tensor Values:")
         print("=" * 80)
         for name, output in zip(all_output_names, all_outputs):
             if output is not None:
+                # Get the node that produces this output
+                node = tensor_to_node.get(name)
+                op_type = node.op_type if node else "UNKNOWN"
+
                 flattened = output.flatten()
                 num_elements = min(10, len(flattened))
-                print(f"\n{name}:")
+
+                print(f"\n{name} ({op_type}):")
+
+                # Print inputs if the node exists
+                if node and len(node.input) > 0:
+                    print(f"  Input:")
+                    for input_name in node.input:
+                        if input_name in tensor_value_map:
+                            input_value = tensor_value_map[input_name]
+                            input_node = tensor_to_node.get(input_name)
+                            input_op_type = input_node.op_type if input_node else "NONE"
+
+                            input_flattened = input_value.flatten()
+                            input_num_elements = min(10, len(input_flattened))
+
+                            print(f"    {input_name} ({input_op_type}):")
+                            print(f"      Shape: {input_value.shape}, Type: {input_value.dtype}")
+                            print(
+                                f"      Data (first {input_num_elements}): {input_flattened[:input_num_elements].tolist()}"
+                            )
+                        elif input_name in initializer_map:
+                            # This is a constant/initializer
+                            init = initializer_map[input_name]
+                            init_array = onnx.numpy_helper.to_array(init)
+                            init_flattened = init_array.flatten()
+                            init_num_elements = min(10, len(init_flattened))
+
+                            print(f"    {input_name} (CONST):")
+                            print(f"      Shape: {init_array.shape}, Type: {init_array.dtype}")
+                            print(
+                                f"      Data (first {init_num_elements}): {init_flattened[:init_num_elements].tolist()}"
+                            )
+                        else:
+                            # Input not found
+                            print(f"    {input_name} (UNKNOWN): <not available>")
+
                 print(f"  Shape: {output.shape}, Type: {output.dtype}")
-                print(f"  First {num_elements} values: {flattened[:num_elements]}")
+                print(f"  Data (first {num_elements}): {flattened[:num_elements].tolist()}")
         print("=" * 80)
 
         # Clean up temp file
