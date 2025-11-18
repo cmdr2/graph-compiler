@@ -1,9 +1,5 @@
 #pragma once
 
-// Updated function signatures to support additional ONNX parameters
-// Updated: ggml_onnx_conv, ggml_onnx_reshape, ggml_onnx_pad, ggml_onnx_transpose, ggml_onnx_softmax, ggml_onnx_cast,
-// ggml_onnx_randomnormallike
-
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
