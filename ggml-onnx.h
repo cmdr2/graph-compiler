@@ -255,24 +255,9 @@ static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, g
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
 
-    // ONNX MatMul: C = A @ B
-    // For ONNX A[M,K] @ B[K,N] = C[M,N]:
-    //   - GGML representation: a.ne=[K,M,1,1], b.ne=[N,K,1,1] (dimensions are reversed)
-    //
-    // ggml_mul_mat(x, y) computes x^T @ y with:
-    //   - Constraint: x->ne[0] == y->ne[0] (shared dimension)
-    //   - Result shape: [x->ne[1], y->ne[1], y->ne[2], y->ne[3]]
-    //
-    // To compute A @ B:
-    //   - Transpose b: b^T.ne = [K,N,1,1]
-    //   - Call ggml_mul_mat(a, b^T) requires a.ne[0]==b^T.ne[0], i.e., K==K ✓
-    //   - Result shape: [a.ne[1], b^T.ne[1], 1, 1] = [M, N, 1, 1] ✓
+    auto bT = ggml_cont(ctx, ggml_transpose(ctx, b));
 
-    // Transpose b to match dimensions for ggml_mul_mat
-    ggml_tensor* b_t = ggml_cont(ctx, ggml_transpose(ctx, b));
-    print_tensor_shape(b_t, "b_transposed");
-
-    ggml_tensor* result = ggml_mul_mat(ctx, a, b_t);
+    ggml_tensor* result = ggml_mul_mat(ctx, a, bT);
     print_tensor_shape(result, "output");
     return result;
 }
@@ -553,10 +538,6 @@ static inline ggml_tensor* ggml_onnx_transpose(ggml_context* ctx, ggml_tensor* i
 #endif
 
     ggml_tensor* result = ggml_permute(ctx, working_input, axis0, axis1, axis2, axis3);
-
-    // ggml_permute creates a view with transposed strides, but many operations require
-    // a contiguous tensor. Use ggml_cont to make it contiguous.
-    result = ggml_cont(ctx, result);
 
     print_tensor_shape(result, "output");
     return result;
