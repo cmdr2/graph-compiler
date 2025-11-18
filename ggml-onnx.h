@@ -255,9 +255,10 @@ static inline ggml_tensor* ggml_onnx_matmul(ggml_context* ctx, ggml_tensor* a, g
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
 
-    auto bT = ggml_cont(ctx, ggml_transpose(ctx, b));
+    ggml_tensor* A = ggml_cont(ctx, a);
+    ggml_tensor* B = ggml_cont(ctx, ggml_transpose(ctx, b));
 
-    ggml_tensor* result = ggml_mul_mat(ctx, a, bT);
+    ggml_tensor* result = ggml_mul_mat(ctx, B, A);
     print_tensor_shape(result, "output");
     return result;
 }
