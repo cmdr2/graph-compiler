@@ -27,7 +27,7 @@ add_executable(example example.cpp example_graph.h ${SRC_FILES})
 target_include_directories(example PRIVATE src)
 ```
 
-4. Compile (required `cmake` and a working C++ compiler like `g++` or `cl`):
+4. Compile the generated files. This step requires `cmake` and a working C++ compiler like `g++` or `cl`.
 
 ```bash
 cmake -B build
