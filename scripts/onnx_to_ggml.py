@@ -207,7 +207,16 @@ def generate_cpp_code(model, output_path, print_values=False):
     constant_tensors = {}  # Maps: constant_name -> (dims, data_type, values)
 
     # Operators whose constant inputs should become tensors
-    operators_with_tensor_constants = {"InstanceNormalization", "Mul", "Div", "Add", "Sub", "RandomNormalLike"}
+    operators_with_tensor_constants = {
+        "InstanceNormalization",
+        "Mul",
+        "Div",
+        "Add",
+        "Sub",
+        "RandomNormalLike",
+        "Transpose",
+        "MatMul",
+    }
 
     # First pass: identify Constant nodes and extract their values
     constant_node_outputs = {}  # Maps: output_name -> node
