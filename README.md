@@ -18,6 +18,8 @@ python scripts/fold_shape_and_constants.py -i INPUT_FILE.onnx -o intermediate.on
 python scripts/onnx_to_ggml.py intermediate.onnx -o example.cpp
 ```
 
+This will generate `example.cpp` and `example_graph.h`.
+
 3. Edit `CMakeLists.txt` and add these lines to the bottom:
 
 ```cmake
