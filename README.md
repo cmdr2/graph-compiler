@@ -4,6 +4,8 @@
 
 Experimental project. Not ready for real use. I haven't written any optimization passes yet (hence terrible performance).
 
+The code will be rewritten eventually. It's currently just thrown together with a lot of hacks and duplication.
+
 ## Usage
 
 1. Generate an intermediate ONNX file, with a fixed input shape (e.g. `1x3x512x512`):
