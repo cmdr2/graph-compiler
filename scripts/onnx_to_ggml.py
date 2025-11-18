@@ -29,6 +29,7 @@ def sanitize_name(name):
 
 
 def replace_diffusers_names(name):
+    return name
     name = name.replace("attentions.0.to_k", "attentions.0.key")
     name = name.replace("attentions.0.to_q", "attentions.0.query")
     name = name.replace("attentions.0.to_v", "attentions.0.value")
@@ -315,6 +316,7 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("#include <iostream>")
     cpp_lines.append("#include <cstring>")
     cpp_lines.append("#include <unordered_map>")
+    cpp_lines.append("#include <unordered_set>")
     cpp_lines.append("")
     cpp_lines.append('#include "safetensors.hpp"')
     cpp_lines.append(f'#include "{graph_header_path.name}"')
@@ -507,8 +509,9 @@ def generate_cpp_code(model, output_path, print_values=False):
 
     cpp_lines.append("    // Load weight data from safetensors file")
     cpp_lines.append('    // std::cout << "Loading weights from: " << weights_file << std::endl;')
+    cpp_lines.append("    std::unordered_set<std::string> loaded_tensors;  // Track which tensors were loaded")
     cpp_lines.append(
-        "    safetensors::load_from_file(weights_file, [](const std::string& key, const std::string& dtype, const std::vector<uint64_t>& shape, const std::vector<uint8_t>& tensor_data) {"
+        "    safetensors::load_from_file(weights_file, [&loaded_tensors](const std::string& key, const std::string& dtype, const std::vector<uint64_t>& shape, const std::vector<uint8_t>& tensor_data) {"
     )
     cpp_lines.append(
         '        // std::cout << "Read tensor: " << key << ", size: " << tensor_data.size() << " bytes" << std::endl;'
@@ -517,6 +520,7 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("        auto it = tensor_map.find(key);")
     cpp_lines.append("        if (it != tensor_map.end()) {")
     cpp_lines.append("            ggml_tensor* tensor = it->second;")
+    cpp_lines.append("            loaded_tensors.insert(key);  // Mark as loaded")
     cpp_lines.append("")
     # Add special handling for reshape shape tensors
     if reshape_shapes:
@@ -552,6 +556,41 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("        }")
     cpp_lines.append("    });")
     cpp_lines.append('    // std::cout << "Weights loaded successfully" << std::endl;')
+    cpp_lines.append("")
+
+    # Generate code to initialize missing weight-bias pairs based on naming patterns
+    cpp_lines.append("    // Initialize missing weight-bias pairs with default values")
+    cpp_lines.append("    // Following PyTorch's approach: kaiming_uniform for weights, uniform for biases")
+    cpp_lines.append('    std::cout << "Checking for missing weight-bias pairs..." << std::endl;')
+    cpp_lines.append("")
+    cpp_lines.append("    // Look for .weight and .bias pairs in the tensor map")
+    cpp_lines.append("    for (const auto& [key, tensor] : tensor_map) {")
+    cpp_lines.append("        // Check if this is a weight tensor (ends with .weight)")
+    cpp_lines.append('        if (key.length() > 7 && key.substr(key.length() - 7) == ".weight") {')
+    cpp_lines.append("            // Check if weight was not loaded from safetensors")
+    cpp_lines.append("            if (loaded_tensors.find(key) == loaded_tensors.end()) {")
+    cpp_lines.append('                std::cout << "  Initializing missing weight: " << key << std::endl;')
+    cpp_lines.append("                int64_t fan_in, fan_out;")
+    cpp_lines.append("                calculate_fan_in_fan_out(tensor, fan_in, fan_out);")
+    cpp_lines.append("                kaiming_uniform_init(tensor, fan_in);")
+    cpp_lines.append("            }")
+    cpp_lines.append("            ")
+    cpp_lines.append("            // Check for corresponding bias")
+    cpp_lines.append('            std::string bias_key = key.substr(0, key.length() - 7) + ".bias";')
+    cpp_lines.append("            auto bias_it = tensor_map.find(bias_key);")
+    cpp_lines.append("            if (bias_it != tensor_map.end()) {")
+    cpp_lines.append("                // Bias exists, check if it was loaded")
+    cpp_lines.append("                if (loaded_tensors.find(bias_key) == loaded_tensors.end()) {")
+    cpp_lines.append('                    std::cout << "  Initializing missing bias: " << bias_key << std::endl;')
+    cpp_lines.append("                    int64_t fan_in, fan_out;")
+    cpp_lines.append("                    calculate_fan_in_fan_out(tensor, fan_in, fan_out);")
+    cpp_lines.append("                    bias_uniform_init(bias_it->second, fan_in);")
+    cpp_lines.append("                }")
+    cpp_lines.append("            }")
+    cpp_lines.append("        }")
+    cpp_lines.append("    }")
+    cpp_lines.append("")
+
     cpp_lines.append("}")
     cpp_lines.append("")
 

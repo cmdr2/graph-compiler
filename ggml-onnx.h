@@ -9,6 +9,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,13 @@ static inline void print_tensor_shape(ggml_tensor* t, std::string tensor_name = 
 #endif
 }
 
+// Structure to store first 10 values of a tensor for debugging (must match ggml-cpu.c)
+#define GGML_DEBUG_SAMPLE_COUNT 10
+struct ggml_tensor_debug_values {
+    float values[GGML_DEBUG_SAMPLE_COUNT];
+    int count;  // actual number of values stored (may be less than 10 for small tensors)
+};
+
 // Helper function to print tensor values for debugging
 static inline void print_tensor_values(const char* name, ggml_tensor* tensor, int indent = 0,
                                        bool print_inputs = true) {
@@ -59,9 +67,6 @@ static inline void print_tensor_values(const char* name, ggml_tensor* tensor, in
         return;
     }
 
-    std::vector<float> data(n);
-    ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
-
     // Print input
     if (print_inputs) {
         if (tensor->src[0] != NULL) {
@@ -77,16 +82,38 @@ static inline void print_tensor_values(const char* name, ggml_tensor* tensor, in
     std::cout << indentation << "  ";
     print_tensor_shape(tensor);
 
-    // Print values
-    int64_t num_to_print = std::min(n, (int64_t)10);
-    std::cout << indentation << "  ";
-    std::cout << "Data (first " << num_to_print << "): [";
-    std::cout << std::setprecision(8);
-    for (int64_t i = 0; i < num_to_print; i++) {
-        std::cout << data[i];
-        if (i < num_to_print - 1) std::cout << " ";
+    // Try to use debug values stored in extra field first
+    bool used_debug_values = false;
+    if (tensor->extra != NULL) {
+        struct ggml_tensor_debug_values* debug = (struct ggml_tensor_debug_values*)tensor->extra;
+        if (debug->count > 0) {
+            std::cout << indentation << "  ";
+            std::cout << "Data (first " << debug->count << "): [";
+            std::cout << std::setprecision(8);
+            for (int i = 0; i < debug->count; i++) {
+                std::cout << debug->values[i];
+                if (i < debug->count - 1) std::cout << " ";
+            }
+            std::cout << "]\n";
+            used_debug_values = true;
+        }
     }
-    std::cout << "]\n";
+
+    // Fallback to reading from backend if debug values not available
+    if (!used_debug_values) {
+        std::vector<float> data(n);
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+
+        int64_t num_to_print = std::min(n, (int64_t)10);
+        std::cout << indentation << "  ";
+        std::cout << "Data (first " << num_to_print << "): [";
+        std::cout << std::setprecision(8);
+        for (int64_t i = 0; i < num_to_print; i++) {
+            std::cout << data[i];
+            if (i < num_to_print - 1) std::cout << " ";
+        }
+        std::cout << "]\n";
+    }
 }
 
 static inline void ggml_onnx_compute_slice_params(int rank, const std::vector<int64_t>& dim_sizes,
@@ -1139,4 +1166,76 @@ static inline void ggml_onnx_compute_slice_params(int rank, const std::vector<in
         eff_ends[axis] = end;
         eff_steps[axis] = step;
     }
+}
+
+// Helper functions for parameter initialization (Kaiming and bias initialization)
+
+// Helper function to calculate fan_in and fan_out for a weight tensor
+static inline void calculate_fan_in_fan_out(const ggml_tensor* weight, int64_t& fan_in, int64_t& fan_out) {
+    // For Conv2D: weight shape in GGML is [kW, kH, in_channels, out_channels]
+    // fan_in = in_channels * kH * kW
+    // fan_out = out_channels * kH * kW
+    int64_t ne0 = weight->ne[0];  // kW
+    int64_t ne1 = weight->ne[1];  // kH
+    int64_t ne2 = weight->ne[2];  // in_channels
+    int64_t ne3 = weight->ne[3];  // out_channels
+
+    if (ne3 > 1) {
+        // 4D tensor - likely Conv2D weight
+        fan_in = ne2 * ne1 * ne0;
+        fan_out = ne3 * ne1 * ne0;
+    } else if (ne2 > 1) {
+        // 2D tensor (stored as 4D with ne[3]=1, ne[1]=1) - likely Linear weight
+        // In this case ne[0] is out_features, ne[2] is in_features
+        fan_in = ne2;
+        fan_out = ne0;
+    } else {
+        fan_in = ne0;
+        fan_out = ne0;
+    }
+}
+
+// Initialize tensor with Kaiming Uniform (like PyTorch)
+// Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+// uniform(-1/sqrt(in_features), 1/sqrt(in_features))
+static inline void kaiming_uniform_init(ggml_tensor* tensor, int64_t fan_in) {
+    if (fan_in <= 0) fan_in = 1;
+
+    float gain = std::sqrt(5.0f);  // a = sqrt(5)
+    float std = gain / std::sqrt(static_cast<float>(fan_in));
+    float bound = std::sqrt(3.0f) * std;  // uniform bounds
+
+    size_t n_elements = ggml_nelements(tensor);
+    std::vector<float> data(n_elements);
+
+    // Simple random number generation (not cryptographically secure)
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(-bound, bound);
+
+    for (size_t i = 0; i < n_elements; ++i) {
+        data[i] = dis(gen);
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), 0, n_elements * sizeof(float));
+}
+
+// Initialize bias tensor with uniform distribution based on fan_in
+static inline void bias_uniform_init(ggml_tensor* tensor, int64_t fan_in) {
+    if (fan_in <= 0) fan_in = 1;
+
+    float bound = 1.0f / std::sqrt(static_cast<float>(fan_in));
+
+    size_t n_elements = ggml_nelements(tensor);
+    std::vector<float> data(n_elements);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(-bound, bound);
+
+    for (size_t i = 0; i < n_elements; ++i) {
+        data[i] = dis(gen);
+    }
+
+    ggml_backend_tensor_set(tensor, data.data(), 0, n_elements * sizeof(float));
 }
