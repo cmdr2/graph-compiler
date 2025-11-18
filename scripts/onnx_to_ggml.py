@@ -30,11 +30,11 @@ def sanitize_name(name):
 
 def replace_diffusers_names(name):
     return name
-    name = name.replace("attentions.0.to_k", "attentions.0.key")
-    name = name.replace("attentions.0.to_q", "attentions.0.query")
-    name = name.replace("attentions.0.to_v", "attentions.0.value")
-    name = name.replace("attentions.0.to_out.0", "attentions.0.proj_attn")
-    return name
+    # name = name.replace("attentions.0.to_k", "attentions.0.key")
+    # name = name.replace("attentions.0.to_q", "attentions.0.query")
+    # name = name.replace("attentions.0.to_v", "attentions.0.value")
+    # name = name.replace("attentions.0.to_out.0", "attentions.0.proj_attn")
+    # return name
 
 
 def get_ggml_type(elem_type):
