@@ -44,6 +44,6 @@ cmake --build build --config Release
 
 ## Models compiled successfully
 
-Numerically accurate compilation succeeded for:
+Numerically accurate compilation works for:
 * TinyCNN
 * VAE of Stable Diffusion 1.5
