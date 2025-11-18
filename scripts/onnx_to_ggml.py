@@ -1021,6 +1021,7 @@ def generate_cpp_code(model, output_path, print_values=False):
     cpp_lines.append("    // Set input data")
     cpp_lines.append("    ggml_backend_tensor_set(input, input_data, 0, ggml_nbytes(input));")
     cpp_lines.append("")
+    cpp_lines.append('    std::cout << std::endl << "Starting graph computation..." << std::endl;')
     cpp_lines.append("    // Compute the graph")
     cpp_lines.append("    ggml_backend_graph_compute(backend, gf);")
     cpp_lines.append("")
