@@ -268,6 +268,9 @@ static inline ggml_tensor* ggml_onnx_add(ggml_context* ctx, ggml_tensor* a, ggml
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
 
+    a = ggml_cont(ctx, a);
+    b = ggml_cont(ctx, b);
+
     // GGML expects the larger tensor first for broadcasting
     // Determine which tensor is larger by comparing total elements
     int64_t size_a = 1;
@@ -293,6 +296,10 @@ static inline ggml_tensor* ggml_onnx_add(ggml_context* ctx, ggml_tensor* a, ggml
 static inline ggml_tensor* ggml_onnx_sub(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
+
+    a = ggml_cont(ctx, a);
+    b = ggml_cont(ctx, b);
+
     ggml_tensor* result = ggml_sub(ctx, a, b);
     print_tensor_shape(result, "output");
     return result;
@@ -303,6 +310,9 @@ static inline ggml_tensor* ggml_onnx_mul(ggml_context* ctx, ggml_tensor* a, ggml
     // print the shapes of a and b
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
+
+    a = ggml_cont(ctx, a);
+    b = ggml_cont(ctx, b);
 
     // GGML expects the larger tensor first for broadcasting
     // Determine which tensor is larger by comparing total elements
@@ -329,6 +339,10 @@ static inline ggml_tensor* ggml_onnx_mul(ggml_context* ctx, ggml_tensor* a, ggml
 static inline ggml_tensor* ggml_onnx_div(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
     print_tensor_shape(a, "a");
     print_tensor_shape(b, "b");
+
+    a = ggml_cont(ctx, a);
+    b = ggml_cont(ctx, b);
+
     ggml_tensor* result = ggml_div(ctx, a, b);
     print_tensor_shape(result, "output");
     return result;
@@ -555,6 +569,8 @@ static inline ggml_tensor* ggml_onnx_reshape(ggml_context* ctx, ggml_tensor* inp
     if (shape.empty()) {
         return input;
     }
+
+    input = ggml_cont(ctx, input);
 
     ggml_tensor* result;
     if (shape.size() == 1) {
